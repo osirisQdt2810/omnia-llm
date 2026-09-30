@@ -253,6 +253,9 @@ class ProcessEngine(Engine):
     #: How often a start asks whether the process answers yet.
     startup_poll_seconds: ClassVar[float] = 2.0
     shutdown_grace_seconds: ClassVar[float] = 20.0
+    #: How long SIGKILLed processes get to vanish. They cannot refuse it, so this only covers
+    #: dying, and it is reached only by one wedged in a driver.
+    kill_wait_seconds: ClassVar[float] = 5.0
 
     def __init__(self, spec: ModelSpec, probe: DeviceProbe, paths: PathsConfig, *,
                  python: str = sys.executable) -> None:
@@ -472,11 +475,18 @@ class ProcessEngine(Engine):
             if not await group.exited(within=self.shutdown_grace_seconds):
                 group.signal(signal.SIGKILL)
                 # SIGKILL cannot be refused: this only waits for the leader to go, and reaps it.
-                await group.exited(within=5.0)
+                await group.exited(within=self.kill_wait_seconds)
             # What was killed with or after the leader may still be dying, holding the port and
             # the device's memory.
-            await group.gone(within=5.0)
+            await group.gone(within=self.kill_wait_seconds)
             await self._port_released(within=1.0)
+        except asyncio.CancelledError:
+            # The shield keeps a cancelled CALLER from ending this; only the interpreter's
+            # teardown after a forced quit cancels the task itself. No grace is left to give, so
+            # end the group now rather than leave a model holding its device. signal() checks
+            # the leader first, so a group already over is never signalled.
+            group.signal(signal.SIGKILL)
+            raise
         finally:
             if self._stopping is asyncio.current_task():
                 self._stopping = None

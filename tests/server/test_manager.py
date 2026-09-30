@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import json
 import signal
@@ -139,3 +140,30 @@ async def test_a_shutdown_during_the_reapers_stop_still_ends_the_model(tmp_path)
             group.signal(signal.SIGKILL)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 group.leader.wait(timeout=5)
+
+
+async def test_every_model_is_stopped_at_once_and_one_failure_skips_none(tmp_path):
+    """One after another, a shutdown took the sum of every engine's grace period, and one engine
+    raising left the rest running."""
+    m = _manager(tmp_path, TEXT, TEXT2, IMAGE)
+    in_flight, peak, stopped = 0, 0, []
+
+    def stopper(engine_id):
+        async def stop(reason):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.05)
+            in_flight -= 1
+            stopped.append(engine_id)
+            if engine_id == "small":
+                raise RuntimeError("its stop failed")
+        return stop
+
+    for engine_id, engine in m.engines.items():
+        engine.stop = stopper(engine_id)
+    await m.stop_all("gateway shutting down")
+
+    assert peak == 3
+    assert sorted(stopped) == ["omnia-local", "sdxl-turbo", "small"]
+

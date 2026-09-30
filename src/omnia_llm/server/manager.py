@@ -76,8 +76,13 @@ class ModelManager:
         return out
 
     async def stop_all(self, reason: str) -> None:
-        for engine in self.engines.values():
-            await engine.stop(reason)
+        """Stop every engine at once, so a shutdown takes as long as the slowest stop rather than
+        the sum of them all, and one that fails does not leave the others running."""
+        engines = list(self.engines.values())
+        results = await asyncio.gather(*(e.stop(reason) for e in engines), return_exceptions=True)
+        for engine, result in zip(engines, results, strict=True):
+            if isinstance(result, BaseException):
+                print(f"[{engine.id}] stop failed: {result!r}", flush=True)
 
     def start_reaper(self) -> None:
         self._reaper = asyncio.create_task(self._reap_forever())

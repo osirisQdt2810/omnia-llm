@@ -269,11 +269,27 @@ class TestItsProcesses:
         await until(lambda: not engine.running)  # as /status or the reaper would find it
         await until(lambda: not group_alive(group))
 
+    async def test_a_forced_quit_during_a_stop_still_ends_the_model(self, real, paths):
+        """A second Ctrl+C makes the interpreter cancel every task, the ending itself included,
+        and a model that ignores SIGTERM used to be left running with its device mid-grace."""
+        engine = real(IGNORES_SIGTERM)
+        engine.shutdown_grace_seconds = 30
+        group = engine._launch(gpu(7))
+        await until(lambda: "ready" in (paths.logs / "omnia-local.log").read_text())
+        stop = asyncio.create_task(engine.stop("gateway shutting down"))
+        await until(lambda: engine._stopping is not None)
+        await asyncio.sleep(0.1)  # SIGTERM sent and ignored: inside the grace period now
+        engine._stopping.cancel()  # what asyncio.run's teardown does after a forced quit
+        with contextlib.suppress(asyncio.CancelledError):
+            await stop
+        await until(lambda: not group_alive(group.leader.pid), timeout=5)
+
     async def test_a_crashed_model_is_never_signalled_once_it_is_reaped(self, real):
         """Reaping the leader frees its pid, and the kernel may give it to any new process group
         of this user. Signalled later by a /stop, a shutdown or the next start, that group would
         be somebody else's: here, a stand-in given the same id."""
         engine = real(CRASHES)
+        engine.kill_wait_seconds = 0.3  # the stand-in keeps gone() waiting out its bound
         engine._launch(gpu(7))
         await until(lambda: not engine.running)
         victim = subprocess.Popen(SLEEPER, start_new_session=True)
