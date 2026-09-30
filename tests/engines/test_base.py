@@ -9,6 +9,7 @@ import os
 import re
 import signal
 import socket
+import subprocess
 import sys
 import time
 
@@ -20,10 +21,8 @@ from omnia_llm.engines import ENGINES, EngineBusy
 from tests.helpers import fake_probe, free_port, gpu, spec
 
 
-class _FakeProcess:
-    """Stands in for the model's process: alive until something kills it."""
-
-    pid = 4242
+class _FakeGroup:
+    """Stands in for the model's processes: alive until something ends them."""
 
     def __init__(self):
         self.code = None
@@ -39,19 +38,19 @@ def _engine(paths, *, probe=None, ready=True, **spec_kw):
 
     def launch(device):
         launched.append(device.id)
-        engine._process = _FakeProcess()
+        engine._group = _FakeGroup()
         engine._device = device
         engine._started_at = engine._last_used = time.monotonic()
-        return engine._process
+        return engine._group
 
-    async def wait_ready(process):
+    async def wait_ready(group):
         if not ready:
             raise RuntimeError("exited with code 1 during startup")
 
     async def stop(reason):
-        if engine._process is not None:
-            engine._process.code = 0
-        engine._process = engine._device = None
+        if engine._group is not None:
+            engine._group.code = 0
+        engine._group = engine._device = None
 
     engine._launch, engine._wait_until_ready, engine.stop = launch, wait_ready, stop
     return engine, launched
@@ -80,7 +79,7 @@ class TestItStartsOnlyWhenAsked:
         engine, launched = _engine(paths)
         ready, order = asyncio.Event(), []
 
-        async def loading(process):
+        async def loading(group):
             await ready.wait()
             order.append("ready")
 
@@ -121,7 +120,7 @@ class TestItStartsOnlyWhenAsked:
 
         engine.stop = recorded
         await engine.ensure_running()
-        engine._process.code = -9
+        engine._group.code = -9
         await engine.ensure_running()
         assert reasons == ["exited"] and launched == ["nvidia:7", "nvidia:7"]
 
@@ -159,6 +158,8 @@ class TestItGivesTheCardBack:
 
 
 SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
+#: Exits at once, as a model server that crashed.
+CRASHES = [sys.executable, "-c", "raise SystemExit(1)"]
 #: Exits at once, leaving a child behind in its process group, as vLLM's launcher can.
 LEAVES_A_CHILD = [sys.executable, "-c", "import subprocess, sys; "
                   "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])"]
@@ -207,17 +208,20 @@ def real(paths):
         launch = engine._launch
 
         def launched(device):
-            process = launch(device)
-            groups.append(process.pid)
-            return process
+            group = launch(device)
+            groups.append(group)
+            return group
 
         engine._launch = launched
         return engine
 
     yield make
     for group in groups:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(group, signal.SIGKILL)
+        # Only an unreaped leader keeps the id the group's own; a reaped one's is not ours.
+        if group.leader.returncode is None:
+            group.signal(signal.SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                group.leader.wait(timeout=5)
 
 
 class TestItsProcesses:
@@ -226,7 +230,7 @@ class TestItsProcesses:
         is gone and give up, not poll a dead port for the whole startup timeout."""
         engine = real(SLEEPER)
         start = asyncio.create_task(engine.ensure_running())
-        await _until(lambda: engine._process is not None)
+        await _until(lambda: engine._group is not None)
         await engine.stop("asked to stop")
         with pytest.raises(RuntimeError, match="stopped while starting"):
             await asyncio.wait_for(start, timeout=5)
@@ -236,17 +240,43 @@ class TestItsProcesses:
         """vLLM's EngineCore outlives its launcher. Returning early because the leader was gone
         left it running, holding the GPU."""
         engine = real(LEAVES_A_CHILD)
-        group = engine._launch(gpu(7)).pid
-        engine._process.wait(timeout=10)
-        assert _alive(group), "the child should outlive its leader"
+        leader = engine._launch(gpu(7)).leader
+        leader.wait(timeout=10)
+        assert _alive(leader.pid), "the child should outlive its leader"
         await engine.stop("idle")
-        assert not _alive(group)
+        await _until(lambda: not _alive(leader.pid))
+
+    async def test_what_a_crashed_model_left_behind_is_killed_when_the_crash_is_found(self, real):
+        """The instant its leader is reaped is the last at which the group's id is surely its
+        own: its children (vLLM's EngineCore, holding the GPU) are killed then, not at some
+        later stop."""
+        engine = real(LEAVES_A_CHILD)
+        group = engine._launch(gpu(7)).leader.pid
+        await _until(lambda: not engine.running)  # as /status or the reaper would find it
+        await _until(lambda: not _alive(group))
+
+    async def test_a_crashed_model_is_never_signalled_once_it_is_reaped(self, real):
+        """Reaping the leader frees its pid, and the kernel may give it to any new process group
+        of this user. Signalled later by a /stop, a shutdown or the next start, that group would
+        be somebody else's: here, a stand-in given the same id."""
+        engine = real(CRASHES)
+        engine._launch(gpu(7))
+        await _until(lambda: not engine.running)
+        victim = subprocess.Popen(SLEEPER, start_new_session=True)
+        try:
+            engine._group.leader.pid = victim.pid
+            await engine.stop("asked to stop")
+            await asyncio.sleep(0.2)
+            assert victim.poll() is None, "a process group that is not the model's was signalled"
+        finally:
+            victim.kill()
+            victim.wait()
 
     async def test_a_process_that_ignores_sigterm_is_killed_after_the_grace_period(self, real,
                                                                                     paths):
         engine = real(IGNORES_SIGTERM)
         engine.shutdown_grace_seconds = 0.3
-        group = engine._launch(gpu(7)).pid
+        group = engine._launch(gpu(7)).leader.pid
         await _until(lambda: "ready" in (paths.logs / "omnia-local.log").read_text())
         await engine.stop("idle")
         assert not _alive(group)
@@ -256,10 +286,10 @@ class TestItsProcesses:
         is an OSError: raised mid-stop, it would leave this model, and every model stopped
         after it, running."""
         engine = real(LEAVES_A_CHILD)
-        group = engine._launch(gpu(7)).pid
+        group = engine._launch(gpu(7)).leader.pid
         monkeypatch.setattr(sys, "stdout", _HungUpTerminal())
         await engine.stop("gateway shutting down")
-        assert not _alive(group)
+        await _until(lambda: not _alive(group))
 
     async def test_a_port_in_use_is_refused_before_anything_starts(self, real):
         """Most likely an engine a gateway that died left behind: it would answer the new
@@ -274,7 +304,7 @@ class TestItsProcesses:
             with pytest.raises(RuntimeError,
                                match=re.escape(f"port {port} is in use (a leftover engine?)")):
                 await engine.ensure_running()
-        assert engine._process is None and engine.status()["device"] is None
+        assert engine._group is None and engine.status()["device"] is None
 
     async def test_a_start_that_exits_names_its_log_but_not_where_it_lives(self, real, paths):
         """The message reaches token holders in a 502, and an absolute path would tell them the
@@ -351,10 +381,10 @@ def test_starting_a_model_leaks_no_file_descriptor(paths, monkeypatch):
     engine = ENGINES.get("vllm")(spec(port=free_port()), fake_probe([gpu(7)]), paths)
     monkeypatch.setattr(engine, "command", lambda device: SLEEPER)
     before = len(os.listdir("/dev/fd"))
-    engine._launch(gpu(7))
+    leader = engine._launch(gpu(7)).leader
     try:
         assert len(os.listdir("/dev/fd")) == before
         assert "=== omnia-local on nvidia:7" in (paths.logs / "omnia-local.log").read_text()
     finally:
-        engine._process.kill()
-        engine._process.wait()
+        leader.kill()
+        leader.wait()

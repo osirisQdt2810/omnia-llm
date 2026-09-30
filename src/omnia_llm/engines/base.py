@@ -50,38 +50,48 @@ def _say(message: str) -> None:
 class _ProcessGroup:
     """A launched model's processes: the leader, and every child it started.
 
-    Its id is the leader's pid (``start_new_session``), so it can be signalled with the leader
-    gone, which is the point: vLLM's EngineCore outlives its launcher, holding the GPU.
+    The group's id is the leader's pid (``start_new_session``), so the group can be signalled
+    with the leader gone, and must be: vLLM's EngineCore outlives its launcher, holding the GPU.
+    But only while the leader is unreaped. Reaping frees that pid, and the kernel may give it to
+    any new process group of this user, a shell job, say. So the leader is reaped here only, in
+    :meth:`poll`, which kills what is left of the group at that instant, the last one at which
+    the id is surely the group's own, and the group is never signalled again.
     """
 
     def __init__(self, leader: subprocess.Popen) -> None:
         self.leader = leader
+        #: The leader is reaped: the id may be another group's by now.
+        self.over = False
 
-    def signal(self, sig: int) -> bool:
-        """Send ``sig`` to every member; False when none of them is alive.
+    def poll(self) -> Optional[int]:
+        """The leader's exit code, or None while it runs."""
+        code = self.leader.poll()
+        if code is not None and not self.over:
+            self.over = True
+            # macOS answers EPERM, not ESRCH, for a group left with zombies only.
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(self.leader.pid, signal.SIGKILL)
+        return code
 
-        macOS answers EPERM, not ESRCH, for a group left with zombies only: dead all the same.
+    def signal(self, sig: int) -> None:
+        """Send ``sig`` to the whole group, unless it is over.
+
+        Safe while the leader is unreaped, even in the moment after it exits: its pid stays
+        taken until it is reaped.
         """
-        try:
-            os.killpg(self.leader.pid, sig)
-        except (ProcessLookupError, PermissionError):
-            return False
-        return True
+        if self.poll() is None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(self.leader.pid, sig)
 
     async def exited(self, within: float) -> bool:
-        """Whether every member has exited within ``within`` seconds.
-
-        The leader is reaped on each pass: unreaped, it is a zombie, and on Linux a zombie still
-        counts as a member of its group.
-        """
+        """Whether the group is over, its leader reaped and the rest killed, within ``within``
+        seconds."""
         deadline = time.monotonic() + within
-        while True:
-            self.leader.poll()
-            if not self.signal(0):
-                return True
+        while self.poll() is None:
             if time.monotonic() >= deadline:
                 return False
             await asyncio.sleep(0.1)
+        return True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -222,7 +232,7 @@ class ProcessEngine(Engine):
                  python: str = sys.executable) -> None:
         super().__init__(spec, probe, paths)
         self.python = python
-        self._process: Optional[subprocess.Popen] = None
+        self._group: Optional[_ProcessGroup] = None
         self._device: Optional[Device] = None
         self._lock = asyncio.Lock()
         self._last_used = 0.0
@@ -265,7 +275,7 @@ class ProcessEngine(Engine):
     # --- state -------------------------------------------------------------------------------
     @property
     def running(self) -> bool:
-        return self._process is not None and self._process.poll() is None
+        return self._group is not None and self._group.poll() is None
 
     @property
     def device(self) -> Optional[Device]:
@@ -296,9 +306,9 @@ class ProcessEngine(Engine):
         async with self._lock:
             if self.running:
                 return
-            if self._process is not None:
-                # It exited on its own (a crash, the OOM killer). Its children need not have,
-                # and they would hold the device this start is about to pick.
+            if self._group is not None:
+                # It exited on its own (a crash, the OOM killer), and what it left behind was
+                # killed when that was found: only its bookkeeping is left to clear.
                 await self.stop("exited")
             device = self.probe.pick(self.spec.required_mib, prefer)
             if device is None:
@@ -315,7 +325,7 @@ class ProcessEngine(Engine):
             finally:
                 self._starting = False
 
-    def _launch(self, device: Device) -> subprocess.Popen:
+    def _launch(self, device: Device) -> _ProcessGroup:
         self._check_port_is_free()
         self.paths.logs.mkdir(parents=True, exist_ok=True)
         self.paths.hf_hub_cache.mkdir(parents=True, exist_ok=True)
@@ -324,11 +334,12 @@ class ProcessEngine(Engine):
         with open(self.paths.logs / f"{self.id}.log", "ab", buffering=0) as log:
             log.write(f"\n=== {self.id} on {device.id} at {time.strftime('%F %T')} ===\n".encode())
             # Its own process group, so stopping it takes the worker children too.
-            process = subprocess.Popen(self.command(device), env=self.environment(device),
-                                       stdout=log, stderr=log, start_new_session=True)
-        self._process, self._device = process, device
+            group = _ProcessGroup(subprocess.Popen(
+                self.command(device), env=self.environment(device), stdout=log, stderr=log,
+                start_new_session=True))
+        self._group, self._device = group, device
         self._started_at = self._last_used = time.monotonic()
-        return process
+        return group
 
     def _check_port_is_free(self) -> None:
         """Refuse a port something already listens on.
@@ -346,12 +357,12 @@ class ProcessEngine(Engine):
                 raise RuntimeError(f"port {self.spec.port} is in use (a leftover engine?); "
                                    f"nothing was started for {self.id!r}") from None
 
-    async def _wait_until_ready(self, process: subprocess.Popen) -> None:
-        """Poll until ``process`` answers its health check.
+    async def _wait_until_ready(self, group: _ProcessGroup) -> None:
+        """Poll until ``group`` answers its health check.
 
-        Asked of the process THIS start launched, not of whatever ``_process`` holds now: a
-        /stop does not wait for the lock a start holds, and a start that only checked
-        ``_process`` would go on polling a dead port for the whole startup timeout.
+        Asked of the group THIS start launched, not of whatever ``_group`` holds now: a /stop
+        does not wait for the lock a start holds, and a start that only checked ``_group``
+        would go on polling a dead port for the whole startup timeout.
         """
         deadline = time.monotonic() + self.startup_timeout_seconds
         url = f"http://127.0.0.1:{self.spec.port}{self.health_path}"
@@ -360,13 +371,14 @@ class ProcessEngine(Engine):
             with contextlib.suppress(Exception):  # not up yet is the normal case here
                 ready = (await self._client.get(url, timeout=5.0)).status_code == 200
             # After the health check, which a stop may have happened during.
-            if self._process is not process:
+            if self._group is not group:
                 raise RuntimeError(f"{self.id!r} was stopped while starting")
-            if process.poll() is not None:
+            code = group.poll()
+            if code is not None:
                 # Relative on purpose: this reaches every token holder in a 502, and the full
                 # path would tell them the server's user name.
-                raise RuntimeError(f"{self.id!r} exited with code {process.returncode} during "
-                                   f"startup; see logs/{self.id}.log in the server's state folder")
+                raise RuntimeError(f"{self.id!r} exited with code {code} during startup; see "
+                                   f"logs/{self.id}.log in the server's state folder")
             if ready:
                 return
             await asyncio.sleep(self.startup_poll_seconds)
@@ -376,20 +388,20 @@ class ProcessEngine(Engine):
     async def stop(self, reason: str) -> None:
         """End the process GROUP: SIGTERM, then SIGKILL once the grace period is up.
 
-        The group, always, even when its leader has exited: the children need not have, and a
-        worker left running keeps the device's memory, which would defeat the idle timer.
-        Killed first, logged after (see :func:`_say`).
+        The group, not only the leader: a worker left running keeps the device's memory, which
+        would defeat the idle timer. A group that is already over (see :class:`_ProcessGroup`)
+        is not signalled at all, and only its bookkeeping is cleared. Killed first, logged
+        after (see :func:`_say`).
         """
-        process, self._process = self._process, None
+        group, self._group = self._group, None
         device, self._device = self._device, None
-        if process is None:
+        if group is None:
             return
-        group = _ProcessGroup(process)
         group.signal(signal.SIGTERM)
         _say(f"[{self.id}] stopping ({device.id if device else '?'}): {reason}")
         if not await group.exited(within=self.shutdown_grace_seconds):
             group.signal(signal.SIGKILL)
-            # SIGKILL cannot be refused: this only lets the kernel finish, and reaps the leader.
+            # SIGKILL cannot be refused: this only waits for the leader to go, and reaps it.
             await group.exited(within=5.0)
 
     # --- traffic -----------------------------------------------------------------------------
