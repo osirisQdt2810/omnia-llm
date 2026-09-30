@@ -135,6 +135,18 @@ def test_an_unknown_model_is_a_404_not_a_cold_start(gateway):
     assert gateway.started == [] and gateway.forwarded == []
 
 
+@pytest.mark.parametrize("method, path", [
+    ("GET", "/v1/"), ("GET", "/v1//"), ("POST", "/v1/"),
+    ("GET", "/v1/images"), ("GET", "/v1/images/edits"), ("POST", "/v1/images/edits"),
+    ("POST", "/v1/images/variations"), ("POST", "/v1/images/generations/extra"),
+])
+def test_a_path_nothing_here_serves_is_a_404_not_a_cold_start(gateway, method, path):
+    """Sent on, the text model would answer these with a 404 of its own, after a cold start."""
+    r = gateway.request(method, path, json={"prompt": "a lighthouse"})
+    assert r.status_code == 404 and r.json()["error"]["type"] == "not_found"
+    assert gateway.started == [] and gateway.forwarded == []
+
+
 @pytest.mark.parametrize("path", ["/v1/%2e%2e/metrics", "/v1/models/..%2fmetrics",
                                   "/v1/chat/%2e/completions"])
 def test_a_path_with_dot_segments_is_refused_not_forwarded(gateway, path):

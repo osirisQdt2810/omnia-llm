@@ -141,9 +141,16 @@ def create_app(config: AppConfig, probe: Optional[DeviceProbe] = None) -> FastAP
         segments = [s for s in path.split("/") if s]
         if "." in segments or ".." in segments:
             return _error(400, "a path may not contain '.' or '..' segments", "invalid_request")
-        if segments[:1] == ["models"]:
+        # Nothing is served at /v1/ itself, and of images only generations: sent on, the text
+        # model would answer those with a 404 of its own, after a cold start.
+        if not segments:
+            return _error(404, "nothing is served at /v1/ itself", "not_found")
+        if segments[0] == "models":
             return _models(manager, "/".join(segments[1:]))
-        kind = "image" if segments == ["images", "generations"] else "text"
+        if segments[0] == "images" and segments != ["images", "generations"]:
+            return _error(404, f"/v1/{'/'.join(segments)} is not served here; images come from "
+                               "/v1/images/generations", "not_found")
+        kind = "image" if segments[0] == "images" else "text"
         body = await request.body()
         engine = manager.route(kind, _model_of(body))
         if engine is None:
