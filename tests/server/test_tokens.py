@@ -12,8 +12,8 @@ from omnia_llm.server.tokens import TokenStore
 
 def test_an_issued_token_verifies_under_its_name(tmp_path):
     store = TokenStore(tmp_path / "tokens.json")
-    token = store.issue("phuc-mac")
-    assert store.verify(token) == "phuc-mac"
+    token = store.issue("laptop")
+    assert store.verify(token) == "laptop"
     assert store.verify(token + "x") is None
     assert store.verify("") is None
 

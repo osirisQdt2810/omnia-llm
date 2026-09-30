@@ -1,6 +1,13 @@
 # Runtime state (tokens, the legacy key, logs) and downloaded model weights. Never committed.
 state/
 .model-cache/
+# Where the old flat layout kept the same things: anchored, so a leftover is never committable.
+/api-key.txt
+/tokens.json
+/tokens.tmp
+/ngrok.env
+/hf-cache/
+/logs/
 # This deployment's choices: its config and its public address (see deploy/*.example).
 deploy/omnia-llm.env
 deploy/ngrok.env

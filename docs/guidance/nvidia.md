@@ -11,8 +11,9 @@ that other people use too.
 
 1. Install (this takes a while): `scripts/install.sh nvidia`
 2. See the GPUs it can use: `.venv/bin/omnia-llm devices`.
-   A GPU counts as free when nothing runs on it. omnia-llm takes one free GPU only, the
-   highest-numbered one, and both models share it.
+   A GPU counts as free when nothing runs on it. Each model prefers the GPU the other model is
+   already on, and takes a second free one only when that one lacks room. With neither model
+   running, it takes the highest-numbered free GPU.
 3. Create a token for each person or device, and copy it now, because it is shown only once:
    `.venv/bin/omnia-llm token issue <name>`
 
