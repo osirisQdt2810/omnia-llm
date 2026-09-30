@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -35,8 +36,16 @@ def _serve(args: argparse.Namespace) -> int:
     from omnia_llm.server.app import create_app
 
     config = _config(args.config)
-    uvicorn.run(create_app(config), host=args.host or config.server.host,
-                port=args.port or config.server.port, log_level="info")
+    server = uvicorn.Server(uvicorn.Config(create_app(config), host=args.host or config.server.host,
+                                           port=args.port or config.server.port, log_level="info"))
+    # Closing the terminal sends SIGHUP, whose default is to die on the spot, without the
+    # lifespan shutdown: the models, each in a session of its own, would go on holding their
+    # devices. Taken as uvicorn takes SIGTERM, it is a graceful exit that stops them first.
+    previous = signal.signal(signal.SIGHUP, server.handle_exit)
+    try:
+        server.run()
+    finally:
+        signal.signal(signal.SIGHUP, previous)
     return 0
 
 

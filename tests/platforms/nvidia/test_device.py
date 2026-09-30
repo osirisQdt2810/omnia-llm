@@ -18,8 +18,11 @@ class TestNvidia:
         assert [(c.index, c.memory_used_mib, c.has_compute_apps) for c in cards] == [
             (0, 52, False), (7, 13825, True)]
 
-    def test_a_card_is_pinned_with_cuda_visible_devices(self):
-        assert dict(NvidiaProbe.parse(self.ROWS, "")[1].env) == {"CUDA_VISIBLE_DEVICES": "7"}
+    def test_a_card_is_pinned_by_the_index_nvidia_smi_reported(self):
+        """CUDA numbers cards fastest first unless told otherwise, nvidia-smi by PCI bus: without
+        the order, "7" can be another card than the one found free."""
+        assert dict(NvidiaProbe.parse(self.ROWS, "")[1].env) == {
+            "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "7"}
 
     def test_an_unreadable_tool_is_an_error_not_a_guess(self, monkeypatch):
         import omnia_llm.platforms.nvidia.device as mod

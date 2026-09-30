@@ -21,7 +21,13 @@ def test_every_shipped_config_loads():
 def test_downloaded_models_stay_inside_the_repo_by_default():
     paths = AppConfig.from_dict(_cfg()).paths
     assert paths.model_cache == ROOT / ".model-cache"
-    assert paths.hf_home.parent == paths.llama_cache.parent == ROOT / ".model-cache"
+    assert paths.llama_cache.parent == paths.vllm_cache.parent == ROOT / ".model-cache"
+
+
+def test_hugging_face_downloads_stay_where_the_last_layout_put_them():
+    """HF_HOME used to be <model_cache>/huggingface, so its hub is where the weights already are."""
+    paths = AppConfig.from_dict(_cfg()).paths
+    assert paths.hf_hub_cache == ROOT / ".model-cache" / "huggingface" / "hub"
 
 
 def test_a_relative_model_cache_resolves_against_the_repo(tmp_path, monkeypatch):

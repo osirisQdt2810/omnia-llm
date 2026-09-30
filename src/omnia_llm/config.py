@@ -59,9 +59,15 @@ class PathsConfig:
         return self.state / "logs"
 
     @property
-    def hf_home(self) -> Path:
-        """Hugging Face downloads (vLLM, MLX, diffusers)."""
-        return self.model_cache / "huggingface"
+    def hf_hub_cache(self) -> Path:
+        """Hugging Face downloads (vLLM, MLX, diffusers): the hub that HF_HOME set to
+        <model_cache>/huggingface used to fill, so nothing downloaded before is fetched again."""
+        return self.model_cache / "huggingface" / "hub"
+
+    @property
+    def vllm_cache(self) -> Path:
+        """vLLM's own cache: its compiled graphs, kept with the weights."""
+        return self.model_cache / "vllm"
 
     @property
     def llama_cache(self) -> Path:

@@ -19,6 +19,7 @@ import dataclasses
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -32,6 +33,54 @@ from omnia_llm.devices import Device, DeviceProbe
 
 class EngineBusy(RuntimeError):
     """No device has room right now. A thing to wait out (503), not a bug to report."""
+
+
+def _say(message: str) -> None:
+    """Print one lifecycle line, and never raise.
+
+    Closing the terminal the gateway runs in is the SIGHUP that starts its shutdown, and from
+    then on stdout is a hung-up tty where a print is an OSError. Raised inside a stop, it would
+    leave that model's processes, and every model stopped after it, running.
+    """
+    with contextlib.suppress(OSError):
+        print(message, flush=True)
+
+
+class _ProcessGroup:
+    """A launched model's processes: the leader, and every child it started.
+
+    Its id is the leader's pid (``start_new_session``), so it can be signalled with the leader
+    gone, which is the point: vLLM's EngineCore outlives its launcher, holding the GPU.
+    """
+
+    def __init__(self, leader: subprocess.Popen) -> None:
+        self.leader = leader
+
+    def signal(self, sig: int) -> bool:
+        """Send ``sig`` to every member; False when none of them is alive.
+
+        macOS answers EPERM, not ESRCH, for a group left with zombies only: dead all the same.
+        """
+        try:
+            os.killpg(self.leader.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            return False
+        return True
+
+    async def exited(self, within: float) -> bool:
+        """Whether every member has exited within ``within`` seconds.
+
+        The leader is reaped on each pass: unreaped, it is a zombie, and on Linux a zombie still
+        counts as a member of its group.
+        """
+        deadline = time.monotonic() + within
+        while True:
+            self.leader.poll()
+            if not self.signal(0):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.1)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -120,6 +169,8 @@ class ProcessEngine(Engine):
     #: GET here answers 200 once the process can take requests.
     health_path: ClassVar[str] = "/health"
     startup_timeout_seconds: ClassVar[float] = 900.0
+    #: How often a start asks whether the process answers yet.
+    startup_poll_seconds: ClassVar[float] = 2.0
     shutdown_grace_seconds: ClassVar[float] = 20.0
 
     def __init__(self, spec: ModelSpec, probe: DeviceProbe, paths: PathsConfig, *,
@@ -140,11 +191,15 @@ class ProcessEngine(Engine):
         """The argv that serves this model on ``self.spec.port``."""
 
     def environment(self, device: Device) -> dict[str, str]:
-        """The child's environment: pinned to ``device``, downloads kept in the model cache."""
+        """The child's environment: pinned to ``device``, downloads kept in the model cache.
+
+        The hub cache moves, HF_HOME does not: that is also where ``huggingface-cli login``
+        keeps its token, and without the token a gated model is a 401.
+        """
         env = dict(os.environ)
         env.update(dict(device.env))
         env.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-        env["HF_HOME"] = str(self.paths.hf_home)
+        env["HF_HUB_CACHE"] = str(self.paths.hf_hub_cache)
         return env
 
     @property
@@ -190,14 +245,17 @@ class ProcessEngine(Engine):
         async with self._lock:
             if self.running:
                 return
+            if self._process is not None:
+                # It exited on its own (a crash, the OOM killer). Its children need not have,
+                # and they would hold the device this start is about to pick.
+                await self.stop("exited")
             device = self.probe.pick(self.spec.required_mib, prefer)
             if device is None:
                 raise EngineBusy(f"no device has {self.spec.required_mib} MiB free right now "
                                  f"for {self.id!r} — nothing was started")
             self._starting = True
             try:
-                self._launch(device)
-                await self._wait_until_ready()
+                await self._wait_until_ready(self._launch(device))
             except BaseException:
                 # A start that did not finish holds no device — the invariant lives here, at the
                 # only place that owns the lifecycle, so no future failure mode can forget it.
@@ -206,49 +264,82 @@ class ProcessEngine(Engine):
             finally:
                 self._starting = False
 
-    def _launch(self, device: Device) -> None:
+    def _launch(self, device: Device) -> subprocess.Popen:
+        self._check_port_is_free()
         self.paths.logs.mkdir(parents=True, exist_ok=True)
-        self.paths.hf_home.mkdir(parents=True, exist_ok=True)
+        self.paths.hf_hub_cache.mkdir(parents=True, exist_ok=True)
         # The child gets its own copy of the log's descriptor. The parent's is closed here rather
         # than left to the garbage collector.
         with open(self.paths.logs / f"{self.id}.log", "ab", buffering=0) as log:
             log.write(f"\n=== {self.id} on {device.id} at {time.strftime('%F %T')} ===\n".encode())
             # Its own process group, so stopping it takes the worker children too.
-            self._process = subprocess.Popen(self.command(device), env=self.environment(device),
-                                             stdout=log, stderr=log, start_new_session=True)
-        self._device = device
+            process = subprocess.Popen(self.command(device), env=self.environment(device),
+                                       stdout=log, stderr=log, start_new_session=True)
+        self._process, self._device = process, device
         self._started_at = self._last_used = time.monotonic()
+        return process
 
-    async def _wait_until_ready(self) -> None:
+    def _check_port_is_free(self) -> None:
+        """Refuse a port something already listens on.
+
+        Most likely an engine left behind by a gateway that died: it would answer the new
+        start's health check, then take its traffic, from a device nobody accounts for.
+        Bound with SO_REUSEADDR, as the engines' own servers bind: a connection from the last
+        run still in TIME_WAIT is not a listener.
+        """
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("127.0.0.1", self.spec.port))
+            except OSError:
+                raise RuntimeError(f"port {self.spec.port} is in use (a leftover engine?); "
+                                   f"nothing was started for {self.id!r}") from None
+
+    async def _wait_until_ready(self, process: subprocess.Popen) -> None:
+        """Poll until ``process`` answers its health check.
+
+        Asked of the process THIS start launched, not of whatever ``_process`` holds now: a
+        /stop does not wait for the lock a start holds, and a start that only checked
+        ``_process`` would go on polling a dead port for the whole startup timeout.
+        """
         deadline = time.monotonic() + self.startup_timeout_seconds
         url = f"http://127.0.0.1:{self.spec.port}{self.health_path}"
         while time.monotonic() < deadline:
-            if self._process is not None and self._process.poll() is not None:
-                raise RuntimeError(f"{self.id!r} exited with code {self._process.returncode} "
-                                   f"during startup — see {self.paths.logs / (self.id + '.log')}")
+            ready = False
             with contextlib.suppress(Exception):  # not up yet is the normal case here
-                if (await self._client.get(url, timeout=5.0)).status_code == 200:
-                    return
-            await asyncio.sleep(2.0)
+                ready = (await self._client.get(url, timeout=5.0)).status_code == 200
+            # After the health check, which a stop may have happened during.
+            if self._process is not process:
+                raise RuntimeError(f"{self.id!r} was stopped while starting")
+            if process.poll() is not None:
+                # Relative on purpose: this reaches every token holder in a 502, and the full
+                # path would tell them the server's user name.
+                raise RuntimeError(f"{self.id!r} exited with code {process.returncode} during "
+                                   f"startup; see logs/{self.id}.log in the server's state folder")
+            if ready:
+                return
+            await asyncio.sleep(self.startup_poll_seconds)
         raise RuntimeError(f"{self.id!r} did not become ready within "
                            f"{self.startup_timeout_seconds:.0f}s")
 
     async def stop(self, reason: str) -> None:
-        """SIGTERM the process GROUP, SIGKILL after a grace period — a leaked worker keeps the
-        device memory allocated, which would defeat the idle timer."""
+        """End the process GROUP: SIGTERM, then SIGKILL once the grace period is up.
+
+        The group, always, even when its leader has exited: the children need not have, and a
+        worker left running keeps the device's memory, which would defeat the idle timer.
+        Killed first, logged after (see :func:`_say`).
+        """
         process, self._process = self._process, None
         device, self._device = self._device, None
-        if process is None or process.poll() is not None:
+        if process is None:
             return
-        print(f"[{self.id}] stopping ({device.id if device else '?'}): {reason}", flush=True)
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-        for _ in range(int(self.shutdown_grace_seconds * 2)):
-            if process.poll() is not None:
-                return
-            await asyncio.sleep(0.5)
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        group = _ProcessGroup(process)
+        group.signal(signal.SIGTERM)
+        _say(f"[{self.id}] stopping ({device.id if device else '?'}): {reason}")
+        if not await group.exited(within=self.shutdown_grace_seconds):
+            group.signal(signal.SIGKILL)
+            # SIGKILL cannot be refused: this only lets the kernel finish, and reaps the leader.
+            await group.exited(within=5.0)
 
     # --- traffic -----------------------------------------------------------------------------
     def rewrite(self, body: bytes) -> bytes:

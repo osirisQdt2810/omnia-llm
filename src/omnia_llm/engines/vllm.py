@@ -37,3 +37,9 @@ class VllmEngine(ProcessEngine):
             "--tensor-parallel-size", "1",
             *o.extra_args,
         )
+
+    def environment(self, device: Device) -> dict[str, str]:
+        env = super().environment(device)
+        # vLLM's compile cache would otherwise go to the home directory.
+        env["VLLM_CACHE_ROOT"] = str(self.paths.vllm_cache)
+        return env

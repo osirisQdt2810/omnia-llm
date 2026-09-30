@@ -53,6 +53,8 @@ class NvidiaProbe(DeviceProbe):
                 has_compute_apps=uuid in busy,
                 # The WHOLE process, including anything a library does at import time, then
                 # cannot see the other cards — a flag would leave room for a stray allocation.
-                env=(("CUDA_VISIBLE_DEVICES", index),),
+                # In nvidia-smi's order: CUDA's own is fastest first, and in it "7" can be
+                # another card than the one found free.
+                env=(("CUDA_DEVICE_ORDER", "PCI_BUS_ID"), ("CUDA_VISIBLE_DEVICES", index)),
             ))
         return devices

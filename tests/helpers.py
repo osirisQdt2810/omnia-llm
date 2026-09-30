@@ -2,8 +2,17 @@
 
 from __future__ import annotations
 
+import socket
+
 from omnia_llm.config import ModelSpec
 from omnia_llm.devices import Device, DeviceProbe
+
+
+def free_port() -> int:
+    """A loopback port nothing listens on, for a test that starts a real process."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 def gpu(index, used=10, util=0, busy=False, total=24564, backend="nvidia"):

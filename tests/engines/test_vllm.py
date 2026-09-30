@@ -1,4 +1,4 @@
-"""vLLM: one card, under the client's model id."""
+"""vLLM: one card, under the client's model id, and its caches kept with the weights."""
 
 from __future__ import annotations
 
@@ -14,3 +14,7 @@ class TestCommand:
                              "vllm.entrypoints.cli.main"]
         assert argv[argv.index("--served-model-name") + 1] == "omnia-local"
         assert argv[argv.index("--tensor-parallel-size") + 1] == "1"
+
+    def test_vllms_compile_cache_stays_in_the_model_cache(self, paths):
+        engine = ENGINES.get("vllm")(spec(), fake_probe(), paths)
+        assert engine.environment(gpu(7))["VLLM_CACHE_ROOT"] == str(paths.model_cache / "vllm")

@@ -1,5 +1,8 @@
 """The HTTP gateway: what is open, what needs a token, the lockout, and the /v1 paths."""
 
+import socket
+import sys
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -168,6 +171,26 @@ def test_a_start_that_fails_is_reported_as_one(gateway):
     r = gateway.request("POST", "/v1/chat/completions", json={})
     assert r.status_code == 502
     assert r.json()["error"]["message"] == "local engine failed to start: RuntimeError"
+
+
+def test_a_port_in_use_is_a_502_that_says_so_and_holds_no_device(tmp_path):
+    with socket.socket() as squatter:
+        squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        squatter.bind(("127.0.0.1", 0))
+        squatter.listen()
+        port = squatter.getsockname()[1]
+        cfg = AppConfig(ServerConfig(), PathsConfig(state=tmp_path / "state"), DevicesConfig(),
+                        (ModelSpec("omnia-local", "text", "vllm", port, options={"model": "t"}),))
+        app = create_app(cfg, fake_probe([gpu(7)]))
+        engine = app.state.manager.engines["omnia-local"]
+        engine.command = lambda device: [sys.executable, "-c", "import time; time.sleep(60)"]
+        engine.startup_timeout_seconds = 1
+        token = app.state.tokens.issue("tester")
+        r = TestClient(app).post("/v1/chat/completions", json={},
+                                 headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 502
+    assert f"port {port} is in use (a leftover engine?)" in r.json()["error"]["message"]
+    assert app.state.manager.status()["omnia-local"]["device"] is None
 
 
 def _config_file(tmp_path):
