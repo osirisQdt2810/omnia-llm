@@ -359,6 +359,10 @@ class ProcessEngine(Engine):
         start's health check, then take its traffic, from a device nobody accounts for.
         Bound with SO_REUSEADDR, as the engines' own servers bind: a connection from the last
         run still in TIME_WAIT is not a listener.
+
+        No defence against other users of this machine. The engines' ports take no token, so
+        anyone here can reach a model directly, or bind its port between this check and the
+        engine's own bind; and on macOS, a listener on 0.0.0.0 passes the check.
         """
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

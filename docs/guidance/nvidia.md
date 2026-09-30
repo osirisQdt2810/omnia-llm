@@ -4,6 +4,9 @@ Runs a 14B text model and an image model together on one 24 GB GPU. Each starts 
 asked for and stops after 30 minutes without requests, handing the GPU back, so it suits a machine
 that other people use too.
 
+Anyone with an account on the same machine can reach the models directly, without a token, so use
+a machine whose other users you trust.
+
 **You need:** Linux, an NVIDIA GPU with at least 24 GB, a driver for CUDA 12.6 or newer, Python
 3.10 to 3.12, and about 20 GB of free disk (the two models take about 16 GB).
 

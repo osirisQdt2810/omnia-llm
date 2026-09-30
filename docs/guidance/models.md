@@ -6,7 +6,7 @@ such as `qwen2.5-14b-instruct-awq`.
 
 | Setting | Meaning |
 |---|---|
-| `id` | The name Omnia shows, and sends back when it asks for this model. Letters, digits, `.`, `_` and `-` only |
+| `id` | The name Omnia shows, and sends back when it asks for this model. Up to 64 letters, digits, `.`, `_` and `-`, starting with a letter or digit |
 | `kind` | `text` or `image` |
 | `engine` | What runs the model (see below) |
 | `port` | A free local port, used by this model only |
