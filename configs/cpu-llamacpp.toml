@@ -1,0 +1,23 @@
+# Any machine, no GPU: a GGUF model through llama.cpp's llama-server.
+# Needs the `llama-server` binary on PATH (a llama.cpp release, or `brew install llama.cpp`).
+# Serve with:  scripts/run.sh configs/cpu-llamacpp.toml
+
+[server]
+host = "127.0.0.1"
+port = 8741
+idle_timeout_minutes = 30
+
+[paths]
+state = "state"
+
+[devices]
+probe = "cpu"
+
+[[models]]
+id = "qwen2.5-1.5b-instruct-q4_k_m"
+kind = "text"
+engine = "llamacpp"
+port = 8742
+[models.options]
+hf_repo = "Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M"
+ctx_size = 4096
