@@ -235,6 +235,8 @@ class ProcessEngine(Engine):
         self._group: Optional[_ProcessGroup] = None
         self._device: Optional[Device] = None
         self._lock = asyncio.Lock()
+        #: Set while a stop is under way: a /stop and the shutdown do not take the lock.
+        self._stopping: Optional[asyncio.Event] = None
         self._last_used = 0.0
         self._started_at = 0.0
         self._starting = False
@@ -306,6 +308,10 @@ class ProcessEngine(Engine):
         async with self._lock:
             if self.running:
                 return
+            if self._stopping is not None:
+                # A /stop is still ending the last run, whose processes hold the port and the
+                # device until they are gone: started now, this would fail on the port.
+                await self._stopping.wait()
             if self._group is not None:
                 # It exited on its own (a crash, the OOM killer), and what it left behind was
                 # killed when that was found: only its bookkeeping is left to clear.
@@ -396,13 +402,23 @@ class ProcessEngine(Engine):
         group, self._group = self._group, None
         device, self._device = self._device, None
         if group is None:
+            if self._stopping is not None:
+                # Another stop has the group: done is when that one is, or a shutdown arriving
+                # during a /stop would leave the old engine to nobody.
+                await self._stopping.wait()
             return
-        group.signal(signal.SIGTERM)
-        _say(f"[{self.id}] stopping ({device.id if device else '?'}): {reason}")
-        if not await group.exited(within=self.shutdown_grace_seconds):
-            group.signal(signal.SIGKILL)
-            # SIGKILL cannot be refused: this only waits for the leader to go, and reaps it.
-            await group.exited(within=5.0)
+        stopped = self._stopping = asyncio.Event()
+        try:
+            group.signal(signal.SIGTERM)
+            _say(f"[{self.id}] stopping ({device.id if device else '?'}): {reason}")
+            if not await group.exited(within=self.shutdown_grace_seconds):
+                group.signal(signal.SIGKILL)
+                # SIGKILL cannot be refused: this only waits for the leader to go, and reaps it.
+                await group.exited(within=5.0)
+        finally:
+            stopped.set()
+            if self._stopping is stopped:
+                self._stopping = None
 
     # --- traffic -----------------------------------------------------------------------------
     def rewrite(self, body: bytes) -> bytes:

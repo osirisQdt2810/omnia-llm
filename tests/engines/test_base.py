@@ -166,6 +166,24 @@ LEAVES_A_CHILD = [sys.executable, "-c", "import subprocess, sys; "
 IGNORES_SIGTERM = [sys.executable, "-c", "import signal, time; "
                    "signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); "
                    "time.sleep(60)"]
+#: Answers /health on {port}, and takes a second to exit on SIGTERM, holding the port meanwhile,
+#: as vLLM does while it winds down.
+SLOW_TO_EXIT = [sys.executable, "-c", """
+import os, signal, sys, threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("content-length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+signal.signal(signal.SIGTERM, lambda *_: threading.Timer(1.0, os._exit, (0,)).start())
+HTTPServer(("127.0.0.1", int(sys.argv[1])), Health).serve_forever()
+""", "{port}"]
 
 
 def _alive(group: int) -> bool:
@@ -203,7 +221,8 @@ def real(paths):
     def make(command, **spec_kw):
         spec_kw.setdefault("port", free_port())
         engine = ENGINES.get("vllm")(spec(**spec_kw), fake_probe([gpu(7)]), paths)
-        engine.command = lambda device: command
+        argv = [part.replace("{port}", str(spec_kw["port"])) for part in command]
+        engine.command = lambda device: argv
         engine.startup_poll_seconds = 0.05
         launch = engine._launch
 
@@ -290,6 +309,29 @@ class TestItsProcesses:
         monkeypatch.setattr(sys, "stdout", _HungUpTerminal())
         await engine.stop("gateway shutting down")
         await _until(lambda: not _alive(group))
+
+    async def test_a_request_during_a_stop_waits_for_the_old_engine_to_go(self, real):
+        """A /stop does not take the lock. Let through at once, the next request found the old
+        engine still holding its port as it wound down, and failed blaming a leftover."""
+        engine = real(SLOW_TO_EXIT)
+        await engine.ensure_running()
+        stopping = asyncio.create_task(engine.stop("asked to stop"))
+        await asyncio.sleep(0.2)  # signalled, and waiting for the old engine to exit
+        await engine.ensure_running()
+        assert engine.running
+        await stopping
+
+    async def test_a_second_stop_waits_for_the_first_to_finish(self, real):
+        """The gateway shutting down while a /stop is under way must not leave before the old
+        engine is gone: nothing would be left to finish the stop."""
+        engine = real(SLOW_TO_EXIT)
+        await engine.ensure_running()
+        group = engine._group
+        first = asyncio.create_task(engine.stop("asked to stop"))
+        await asyncio.sleep(0.2)
+        await engine.stop("gateway shutting down")
+        assert group.over
+        await first
 
     async def test_a_port_in_use_is_refused_before_anything_starts(self, real):
         """Most likely an engine a gateway that died left behind: it would answer the new
