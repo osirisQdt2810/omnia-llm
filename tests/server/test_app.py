@@ -322,3 +322,15 @@ def test_a_gateway_going_away_gives_its_devices_back(tmp_path):
     with TestClient(app):
         assert app.state.manager._reaper is not None and not app.state.manager._reaper.done()
     assert stopped == ["gateway shutting down"]
+
+
+@pytest.mark.parametrize("kinds", [5, "text", [1, 2], {"text": True}])
+def test_warm_refuses_kinds_of_the_wrong_shape(client, kinds):
+    """A bare number was a 500, and a string warmed whatever it happened to contain."""
+    c, token = client
+
+    r = c.post("/warm", json={"kinds": kinds}, headers={"Authorization": f"Bearer {token}"})
+
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "bad_request"
+

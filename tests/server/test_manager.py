@@ -167,3 +167,26 @@ async def test_every_model_is_stopped_at_once_and_one_failure_skips_none(tmp_pat
     assert peak == 3
     assert sorted(stopped) == ["omnia-local", "sdxl-turbo", "small"]
 
+
+async def test_a_shutdown_cancels_a_warm_up_still_starting(tmp_path):
+    """A warm-up that finished its launch after stop_all had looked would leave an engine holding
+    its device once the gateway is gone."""
+    m = _manager(tmp_path, TEXT)
+    started = asyncio.Event()
+
+    async def slow_start(prefer=()):
+        started.set()
+        await asyncio.Event().wait()  # never finishes on its own
+
+    m.engines["omnia-local"].ensure_running = slow_start
+    m.warm(["text"])
+    await started.wait()
+    warm_up = m._warming["omnia-local"]
+    try:
+        await asyncio.wait_for(m.shutdown(), timeout=5)
+
+        assert warm_up.cancelled()
+        assert "omnia-local" not in m._warming
+    finally:
+        warm_up.cancel()  # so a failure here cannot leave the test's loop waiting on it
+

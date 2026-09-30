@@ -121,6 +121,8 @@ def create_app(config: AppConfig, probe: Optional[DeviceProbe] = None) -> FastAP
         """Start models now and return at once (202); poll /status to see them become ready."""
         body = await _json(request)
         kinds = body.get("kinds") or (["text"] if body.get("images") is False else ["text", "image"])
+        if not isinstance(kinds, list) or not all(isinstance(k, str) for k in kinds):
+            return _error(400, '"kinds" must be a list such as ["text", "image"]', "bad_request")
         return JSONResponse({"warming": manager.warm(kinds), "models": manager.status()},
                             status_code=202)
 

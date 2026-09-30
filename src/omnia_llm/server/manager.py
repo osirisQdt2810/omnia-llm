@@ -101,4 +101,11 @@ class ModelManager:
             self._reaper.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._reaper
+        # A warm-up still starting could otherwise finish its launch after stop_all has looked,
+        # and leave an engine holding its device once the gateway is gone. A start cancelled
+        # part-way stops what it launched (Engine.ensure_running).
+        warming = list(self._warming.values())
+        for task in warming:
+            task.cancel()
+        await asyncio.gather(*warming, return_exceptions=True)
         await self.stop_all("gateway shutting down")

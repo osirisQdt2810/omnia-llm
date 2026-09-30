@@ -11,6 +11,9 @@ register_device_probe = DEVICE_PROBES.register
 
 def detect(name: str = "auto") -> DeviceProbe:
     """The probe named ``name``, or for ``auto`` the first available one by priority."""
+    # Deliberately inverted: the registry is complete only once the platforms have registered,
+    # and this is the one call every path to a probe goes through. Deferred to call time, so it
+    # is not an import cycle.
     import omnia_llm.platforms  # noqa: F401 - registers every built-in platform
     if name != "auto":
         cls = DEVICE_PROBES.get(name)
