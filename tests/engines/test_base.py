@@ -12,12 +12,14 @@ import socket
 import subprocess
 import sys
 import time
+import types
 
 import pytest
 
 import omnia_llm.platforms  # noqa: F401 - registration
 from omnia_llm.config import ConfigError
 from omnia_llm.engines import ENGINES, EngineBusy
+from omnia_llm.engines.base import _ProcessGroup
 from tests.helpers import (
     IGNORES_SIGTERM,
     fake_lifecycle,
@@ -161,6 +163,39 @@ class Health(BaseHTTPRequestHandler):
 signal.signal(signal.SIGTERM, lambda *_: threading.Timer(1.0, os._exit, (0,)).start())
 HTTPServer(("127.0.0.1", int(sys.argv[1])), Health).serve_forever()
 """, "{port}"]
+
+
+#: Binds argv[1], then forks a worker that inherits the listening socket and ignores SIGTERM,
+#: as vLLM's API server binds before it forks EngineCore. The leader goes first: on SIGTERM, or
+#: on its own after argv[2] seconds, saying "crashing".
+_PORT_TO_A_CHILD = """
+import os, signal, sys, threading, time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("content-length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+server = HTTPServer(("127.0.0.1", int(sys.argv[1])), Health)
+if os.fork() == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    while True:
+        time.sleep(0.1)
+signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+threading.Thread(target=server.serve_forever, daemon=True).start()
+time.sleep(float(sys.argv[2]) or 3600)
+print("crashing", flush=True)
+os._exit(9)
+"""
+
+
+def _hands_its_port_to_a_child(crash_after: float = 0.0) -> list[str]:
+    return [sys.executable, "-c", _PORT_TO_A_CHILD, "{port}", str(crash_after)]
 
 
 class _HungUpTerminal:
@@ -319,6 +354,56 @@ class TestItsProcesses:
         assert group.over
         await first
 
+    async def test_a_request_right_after_a_stop_starts_a_fresh_engine(self, real):
+        """The worker the leader forked holds the leader's port. Killed once the leader is gone,
+        it keeps the port until it is gone too, and a stop that returned before then sent the
+        next request into "port in use"."""
+        engine = real(_hands_its_port_to_a_child())
+        await engine.ensure_running()
+        await engine.stop("asked to stop")
+        await engine.ensure_running()
+        assert engine.running
+
+    async def test_a_request_that_finds_a_crash_starts_a_fresh_engine(self, real, paths):
+        """The same worker, left behind by a crash the request itself discovers: the request
+        must wait for the killed worker to be gone before it picks a device and a port."""
+        engine = real(_hands_its_port_to_a_child(crash_after=1.0))
+        await engine.ensure_running()
+        await until(lambda: "crashing" in (paths.logs / "omnia-local.log").read_text())
+        await asyncio.sleep(0.2)  # the leader has exited, and nothing has asked about it yet
+        await engine.ensure_running()
+        assert engine.running
+
+    async def test_a_stop_returns_only_once_its_group_is_gone(self, real, monkeypatch):
+        """What was killed with or after the leader may still be dying, holding the device's
+        memory, which a start let through would count as taken."""
+        events = []
+
+        async def gone(group, within):
+            events.append("waiting")
+            await asyncio.sleep(0.2)
+            events.append("gone")
+            return True
+
+        monkeypatch.setattr(_ProcessGroup, "gone", gone)
+        engine = real(SLEEPER)
+        engine._launch(gpu(7))
+        await engine.stop("asked to stop")
+        assert events == ["waiting", "gone"]
+
+    async def test_a_stop_waits_for_its_port_to_come_free(self, real):
+        """macOS frees a dead listener's port up to a millisecond after its process is gone: a
+        start straight after would find it taken, and blame a leftover."""
+        engine = real(SLEEPER)
+        engine._launch(gpu(7))
+        with socket.socket() as late:  # the port, still held a moment after the engine is gone
+            late.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            late.bind(("127.0.0.1", engine.spec.port))
+            late.listen()
+            asyncio.get_running_loop().call_later(0.2, late.close)
+            await engine.stop("asked to stop")
+            assert engine._port_is_free()
+
     async def test_a_port_in_use_is_refused_before_anything_starts(self, real):
         """Most likely an engine a gateway that died left behind: it would answer the new
         start's health check, then its traffic, from a device nobody accounts for."""
@@ -344,6 +429,40 @@ class TestItsProcesses:
         assert "exited with code 3" in message
         assert "see logs/omnia-local.log in the server's state folder" in message
         assert str(paths.state) not in message
+
+
+class TestTheGroupOnceItIsOver:
+    """After the leader is reaped a real signal may reach a stranger, so the group is only ever
+    asked with signal 0 again. No process is signalled here: os.killpg is a stand-in."""
+
+    @pytest.fixture
+    def killpg(self, monkeypatch):
+        sent, answers = [], []
+
+        def fake(pgid, sig):
+            sent.append(sig)
+            answer = answers.pop(0) if answers else None
+            if answer is not None:
+                raise answer
+
+        monkeypatch.setattr(os, "killpg", fake)
+        return sent, answers
+
+    @pytest.mark.parametrize("end", [ProcessLookupError, PermissionError])
+    async def test_its_members_are_waited_for_with_signal_zero_only(self, killpg, end):
+        """PermissionError: macOS, for a group of zombies only."""
+        sent, answers = killpg
+        answers.extend([None, None, end()])
+        group = _ProcessGroup(types.SimpleNamespace(pid=4242))
+        assert await group.gone(within=5.0)
+        assert sent == [0, 0, 0]
+
+    async def test_the_wait_gives_up_at_its_deadline(self, killpg):
+        """A member alive past it, or an id given to another group, only ends the wait."""
+        sent, _ = killpg
+        group = _ProcessGroup(types.SimpleNamespace(pid=4242))
+        assert not await group.gone(within=0.2)
+        assert set(sent) == {0}
 
 
 class TestConfigIsChecked:

@@ -52,10 +52,11 @@ class _ProcessGroup:
 
     The group's id is the leader's pid (``start_new_session``), so the group can be signalled
     with the leader gone, and must be: vLLM's EngineCore outlives its launcher, holding the GPU.
-    But only while the leader is unreaped. Reaping frees that pid, and the kernel may give it to
-    any new process group of this user, a shell job, say. So the leader is reaped here only, in
-    :meth:`poll`, which kills what is left of the group at that instant, the last one at which
-    the id is surely the group's own, and the group is never signalled again.
+    But a real signal, only while the leader is unreaped. Reaping frees that pid, and the kernel
+    may give it to any new process group of this user, a shell job, say. So the leader is
+    reaped here only, in :meth:`poll`, which SIGKILLs what is left of the group at that instant,
+    the last one at which the id is surely the group's own, and the group gets no real signal
+    again. From then on it is asked with signal 0 only, which sends nothing (see :meth:`gone`).
     """
 
     def __init__(self, leader: subprocess.Popen) -> None:
@@ -92,6 +93,26 @@ class _ProcessGroup:
                 return False
             await asyncio.sleep(0.1)
         return True
+
+    async def gone(self, within: float) -> bool:
+        """Whether every member has exited within ``within`` seconds, once the group is over.
+
+        A killed worker still holds the port and the device's memory until it has finished
+        dying, which can outlast its leader: a worker forked after the leader bound the port
+        holds the listening socket. Asked with signal 0, which sends nothing, so safe with the
+        leader reaped: while any member lives, the id cannot go to another group (Linux keeps
+        the group's pid; XNU skips ids in use as a group or a session), and an id given away
+        once they are gone can at worst keep this waiting until ``within`` is up.
+        """
+        deadline = time.monotonic() + within
+        while True:
+            try:
+                os.killpg(self.leader.pid, 0)
+            except (ProcessLookupError, PermissionError):  # EPERM: macOS, zombies only
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.05)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -320,7 +341,8 @@ class ProcessEngine(Engine):
                 await asyncio.shield(self._stopping)
             if self._group is not None:
                 # It exited on its own (a crash, the OOM killer), and what it left behind was
-                # killed when that was found: only its bookkeeping is left to clear.
+                # killed when that was found. The stop waits for that to be gone: until then it
+                # holds the port, and memory the device pick below would count as taken.
                 await self.stop("exited")
             device = self.probe.pick(self.spec.required_mib, prefer)
             if device is None:
@@ -353,25 +375,44 @@ class ProcessEngine(Engine):
         self._started_at = self._last_used = time.monotonic()
         return group
 
-    def _check_port_is_free(self) -> None:
-        """Refuse a port something already listens on.
+    def _port_is_free(self) -> bool:
+        """Whether nothing listens on this engine's port.
 
-        Most likely an engine left behind by a gateway that died: it would answer the new
-        start's health check, then take its traffic, from a device nobody accounts for.
         Bound with SO_REUSEADDR, as the engines' own servers bind: a connection from the last
         run still in TIME_WAIT is not a listener.
-
-        No defence against other users of this machine. The engines' ports take no token, so
-        anyone here can reach a model directly, or bind its port between this check and the
-        engine's own bind; and on macOS, a listener on 0.0.0.0 passes the check.
         """
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 sock.bind(("127.0.0.1", self.spec.port))
             except OSError:
-                raise RuntimeError(f"port {self.spec.port} is in use (a leftover engine?); "
-                                   f"nothing was started for {self.id!r}") from None
+                return False
+        return True
+
+    def _check_port_is_free(self) -> None:
+        """Refuse a port something already listens on.
+
+        Most likely an engine left behind by a gateway that died: it would answer the new
+        start's health check, then take its traffic, from a device nobody accounts for.
+
+        No defence against other users of this machine. The engines' ports take no token, so
+        anyone here can reach a model directly, or bind its port between this check and the
+        engine's own bind; and on macOS, a listener on 0.0.0.0 passes the check.
+        """
+        if not self._port_is_free():
+            raise RuntimeError(f"port {self.spec.port} is in use (a leftover engine?); "
+                               f"nothing was started for {self.id!r}")
+
+    async def _port_released(self, within: float) -> None:
+        """Wait, up to ``within`` seconds, for this engine's port to come free.
+
+        After a stop, the only listener there was the engine's own, and macOS frees a dead
+        listener's port up to a millisecond after its process is gone: a start straight after
+        would still find it taken, and blame a leftover.
+        """
+        deadline = time.monotonic() + within
+        while not self._port_is_free() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
 
     async def _wait_until_ready(self, group: _ProcessGroup) -> None:
         """Poll until ``group`` answers its health check.
@@ -402,7 +443,7 @@ class ProcessEngine(Engine):
                            f"{self.startup_timeout_seconds:.0f}s")
 
     async def stop(self, reason: str) -> None:
-        """End the process GROUP: SIGTERM, then SIGKILL once the grace period is up.
+        """End the process GROUP, and return once nothing of it is left.
 
         The ending runs as a task of its own, which every later stop and start waits for:
         whoever asked for it may be cancelled before it is done (a shutdown cancels the reaper
@@ -419,7 +460,7 @@ class ProcessEngine(Engine):
             await asyncio.shield(self._stopping)
 
     async def _end(self, group: _ProcessGroup, device: Optional[Device], reason: str) -> None:
-        """SIGTERM the group, and SIGKILL it once the grace period is up.
+        """SIGTERM the group, SIGKILL it once the grace period is up, and wait until it is gone.
 
         The group, not only the leader: a worker left running keeps the device's memory, which
         would defeat the idle timer. A group already over (see :class:`_ProcessGroup`) gets no
@@ -432,6 +473,10 @@ class ProcessEngine(Engine):
                 group.signal(signal.SIGKILL)
                 # SIGKILL cannot be refused: this only waits for the leader to go, and reaps it.
                 await group.exited(within=5.0)
+            # What was killed with or after the leader may still be dying, holding the port and
+            # the device's memory.
+            await group.gone(within=5.0)
+            await self._port_released(within=1.0)
         finally:
             if self._stopping is asyncio.current_task():
                 self._stopping = None
