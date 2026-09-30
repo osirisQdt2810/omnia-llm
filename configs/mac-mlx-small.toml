@@ -1,0 +1,24 @@
+# A small quantized text model on an Apple Silicon Mac (MLX, Metal). ~0.9 GB of weights.
+# Serve with:  scripts/run.sh configs/mac-mlx-small.toml
+
+[server]
+host = "127.0.0.1"
+port = 8731   # not 8721: that is where an SSH tunnel to a remote gateway usually sits
+idle_timeout_minutes = 30
+
+[paths]
+state = "state"
+
+[devices]
+probe = "apple"
+
+[[models]]
+id = "qwen2.5-1.5b"
+kind = "text"
+engine = "mlx"
+port = 8732
+[models.options]
+# 4-bit Qwen2.5-1.5B-Instruct: quick on an M-series chip, enough for definitions and examples.
+# Larger: "mlx-community/Qwen2.5-7B-Instruct-4bit" (~4.3 GB) on a 16 GB Mac.
+model = "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
+max_tokens = 512

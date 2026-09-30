@@ -1,8 +1,10 @@
 import json
 import stat
 
-from gateway.lockout import BLOCK_SECONDS, MAX_FAILURES, Lockout
-from gateway.tokens import TokenStore
+import pytest
+
+from omnia_llm.server.lockout import BLOCK_SECONDS, MAX_FAILURES, Lockout
+from omnia_llm.server.tokens import TokenStore
 
 
 def test_an_issued_token_verifies_under_its_name(tmp_path):
@@ -54,6 +56,25 @@ def test_the_old_single_key_is_adopted_once(tmp_path):
     store.adopt("legacy", "omnia-old")
     assert store.verify("omnia-old") == "legacy"
     assert [n["name"] for n in store.names()] == ["legacy"]
+
+
+def test_a_wrong_token_or_a_prefix_of_one_is_refused(tmp_path):
+    store = TokenStore(tmp_path / "tokens.json")
+    token = store.issue("laptop")
+
+    assert store.verify(token[:-1] + ("a" if token[-1] != "a" else "b")) is None
+    assert store.verify(token[:8]) is None
+
+
+@pytest.mark.parametrize("issued", [False, True])
+def test_presenting_nothing_is_never_a_match(tmp_path, issued):
+    """Also with no tokens issued at all: a gateway with an empty store must not then accept
+    every request that simply sends no key."""
+    store = TokenStore(tmp_path / "tokens.json")
+    if issued:
+        store.issue("laptop")
+
+    assert store.verify("") is None
 
 
 def test_a_client_is_blocked_after_repeated_failures():

@@ -1,0 +1,44 @@
+# One shared 24 GB NVIDIA card: a 14B text model and an image model, together (~13.8 GB).
+# The reference deployment. Serve with:  scripts/run.sh configs/nvidia-24gb.toml
+
+[server]
+host = "127.0.0.1"          # loopback only; reach it through ngrok (deploy/) or an SSH tunnel
+port = 8721
+# Minutes with no request before a model is stopped and its card handed back — the promise
+# this service makes to everyone else on the machine.
+idle_timeout_minutes = 30
+
+[paths]
+state = "state"             # tokens, legacy key, logs, weights (gitignored)
+
+[devices]
+probe = "nvidia"
+
+[[models]]
+id = "omnia-local"          # what clients send as `model`
+kind = "text"
+engine = "vllm"
+port = 8722
+required_mib = 14500
+[models.options]
+# Qwen2.5-Instruct answers directly; Qwen3 "thinks" first, which is pure latency for short
+# note fields (and needs --reasoning-parser qwen3 in extra_args or the <think> lands in them).
+model = "Qwen/Qwen2.5-14B-Instruct-AWQ"
+# Note fields are a word in, a sentence out: 4k is plenty, and KV cache is what is traded for
+# room to hold the image model on the same card.
+max_model_len = 4096
+# vLLM preallocates this share of the card. Measured with both models loaded: 0.48 left too
+# little KV cache to start; 0.55 put the pair at 97% of a shared card; 0.50 leaves ~2.7 GiB.
+gpu_memory_utilization = 0.50
+
+[[models]]
+id = "sdxl-turbo"
+kind = "image"
+engine = "diffusers"
+port = 8723
+required_mib = 5000
+[models.options]
+# Distilled to 4 steps, ~7 GB in fp16; with CPU offload ~1.5 GB resident beside the text model.
+model = "stabilityai/sdxl-turbo"
+steps = 4
+cpu_offload = true

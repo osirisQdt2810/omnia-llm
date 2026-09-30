@@ -1,0 +1,19 @@
+[Unit]
+Description=omnia-llm gateway (lazy models on one free device)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspaces/omnia-llm
+# The config to serve lives in deploy/omnia-llm.env (gitignored): OMNIA_LLM_CONFIG=configs/<name>.toml
+EnvironmentFile=%h/workspaces/omnia-llm/deploy/omnia-llm.env
+ExecStart=%h/workspaces/omnia-llm/scripts/run.sh
+Restart=on-failure
+RestartSec=5
+# The gateway holds no device; the engines it spawns do, and are reaped when idle. Killing the
+# whole control group on stop is what stops a restart leaking a held card.
+KillMode=control-group
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

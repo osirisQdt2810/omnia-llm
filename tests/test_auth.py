@@ -1,4 +1,4 @@
-"""The API key: generated once, stored tight, and required before anything costs a GPU."""
+"""The presented token, and the first version's single key."""
 
 from __future__ import annotations
 
@@ -6,50 +6,46 @@ import stat
 
 import pytest
 
-from gateway import auth
+from omnia_llm.server import auth
 
 
-class TestTheKeyFile:
-    def test_it_generates_one_on_first_use(self, tmp_path):
-        key = auth.load_or_create(tmp_path / "api-key.txt")
-
-        assert key.startswith("omnia-") and len(key) > 30
-
-    def test_it_is_stable_across_restarts(self, tmp_path):
+class TestTheFirstVersionsKey:
+    def test_a_new_install_has_none(self, tmp_path):
+        """Nothing is generated: every token a new install accepts is one somebody issued."""
         path = tmp_path / "api-key.txt"
 
-        assert auth.load_or_create(path) == auth.load_or_create(path)
+        assert auth.read_legacy_key(path) == ""
+        assert not path.exists()
 
-    def test_two_gateways_do_not_share_a_key(self, tmp_path):
-        """No default, no shipped value, nothing to forget to change."""
-        a = auth.load_or_create(tmp_path / "a.txt")
-        b = auth.load_or_create(tmp_path / "b.txt")
-
-        assert a != b
-
-    def test_it_is_not_readable_by_anyone_else(self, tmp_path):
-        """On a machine eight people share, a world-readable key file is no key at all."""
+    def test_an_existing_one_is_read(self, tmp_path):
         path = tmp_path / "api-key.txt"
+        path.write_text("omnia-alreadyhere\n")
 
-        auth.load_or_create(path)
-
-        assert not path.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+        assert auth.read_legacy_key(path) == "omnia-alreadyhere"
 
     def test_a_loose_existing_file_is_tightened(self, tmp_path):
+        """On a machine other people share, a world-readable key file is no key at all."""
         path = tmp_path / "api-key.txt"
         path.write_text("omnia-alreadyhere\n")
         path.chmod(0o644)
 
-        auth.load_or_create(path)
+        auth.read_legacy_key(path)
 
         assert not path.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO)
 
-    def test_an_empty_file_is_replaced_rather_than_trusted(self, tmp_path):
+    def test_a_blank_file_is_no_key(self, tmp_path):
         # A truncated file must not become an empty key that then matches an empty header.
         path = tmp_path / "api-key.txt"
         path.write_text("   \n")
 
-        assert auth.load_or_create(path).startswith("omnia-")
+        assert auth.read_legacy_key(path) == ""
+
+    def test_retiring_it_deletes_the_file_once(self, tmp_path):
+        path = tmp_path / "api-key.txt"
+        path.write_text("omnia-alreadyhere\n")
+
+        assert auth.retire_legacy_key(path) and not path.exists()
+        assert not auth.retire_legacy_key(path)
 
 
 class TestReadingTheHeader:
@@ -70,22 +66,3 @@ class TestReadingTheHeader:
     def test_anything_else_presents_nothing(self, header):
         assert auth.presented_key(header, None) == ""
 
-
-class TestComparing:
-    def test_the_right_key_matches(self):
-        assert auth.matches("omnia-abc", "omnia-abc")
-
-    def test_a_wrong_key_does_not(self):
-        assert not auth.matches("omnia-abd", "omnia-abc")
-
-    @pytest.mark.parametrize("pair", [("", "omnia-abc"), ("omnia-abc", ""), ("", "")])
-    def test_empty_never_matches(self, pair):
-        """Including empty-against-empty.
-
-        A gateway that somehow had no key would otherwise accept every request that sent no
-        key — open to everyone, and silently.
-        """
-        assert not auth.matches(*pair)
-
-    def test_a_prefix_of_the_key_does_not_match(self):
-        assert not auth.matches("omnia-", "omnia-abc")
