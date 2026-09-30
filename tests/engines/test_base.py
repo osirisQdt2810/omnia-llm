@@ -282,7 +282,11 @@ class TestItsProcesses:
         engine._stopping.cancel()  # what asyncio.run's teardown does after a forced quit
         with contextlib.suppress(asyncio.CancelledError):
             await stop
-        await until(lambda: not group_alive(group.leader.pid), timeout=5)
+        # Killed, not merely asked: it ignores SIGTERM. Reaped here because the task that would
+        # have reaped it is the one cancelled; after a real forced quit, init reaps it (on
+        # Linux a zombie still counts as a member of its group until then).
+        assert group.leader.wait(timeout=5) == -signal.SIGKILL
+        assert not group_alive(group.leader.pid)
 
     async def test_a_crashed_model_is_never_signalled_once_it_is_reaped(self, real):
         """Reaping the leader frees its pid, and the kernel may give it to any new process group
