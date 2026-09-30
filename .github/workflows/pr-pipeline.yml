@@ -1,0 +1,239 @@
+# PR pipeline: tests + lint -> Claude review -> gated auto-merge. The same gate as Omnia's.
+#
+# Merge gate — a PR auto-merges ONLY when ALL of these hold:
+#   1. tests + lint are green on the PR's head commit,
+#   1b. the PR description carries every section of the PR template,
+#   2. the Claude review job produced an explicit APPROVE verdict for this run
+#      (missing/garbled verdict counts as BLOCKING — the gate fails closed),
+#   3. the PR carries the `automerge` label at merge time (the human/author
+#      intent switch: omit it and the pipeline is review-only, merge manually),
+#   4. the head commit at merge time is exactly the one this run reviewed
+#      (--match-head-commit blocks TOCTOU pushes mid-run).
+# Fork PRs cannot read the review secret, so the review job fails closed and
+# `needs` blocks the merge job; fork runs also get a read-only GITHUB_TOKEN.
+#
+# One-time repo setup:
+#   - install the Claude GitHub App on the repo,
+#   - add the CLAUDE_CODE_OAUTH_TOKEN actions secret (`claude setup-token`),
+#   - create the `automerge` label.
+#
+# Known limitation (by design): a PR that MODIFIES any .github/workflows file
+# cannot pass the review job — the Claude GitHub App refuses to mint a token
+# when the workflow content differs from the default branch (anti-tampering).
+# Such PRs always need a manual merge.
+
+name: PR Pipeline
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    branches: [main]
+
+concurrency:
+  group: pr-pipeline-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # The gateway runs on Linux (NVIDIA, AMD, CPU) and on macOS (Apple Silicon). Not on
+        # Windows: it stops models by process group, which Windows does not have.
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.13"]
+        include:
+          # Every interpreter from the supported minimum up gets a leg: a gap in the middle
+          # fails on somebody's server, not here.
+          - os: ubuntu-latest
+            python-version: "3.10"
+          - os: ubuntu-latest
+            python-version: "3.11"
+          - os: ubuntu-latest
+            python-version: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        # The package and its test extras only. No GPU stack and no weights: the engines are
+        # exercised through fake probes and fake processes, so this needs no hardware.
+        run: pip install -e ".[dev]" "ruff==0.15.20"
+      - name: Lint
+        # One lint leg is enough; the rules live in pyproject.toml.
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13'
+        run: ruff check .
+      - name: Run test suite
+        run: python -m pytest -q
+
+  pr-body:
+    name: PR description
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      # A template only PRE-FILLS the web UI — `gh pr create --body` bypasses it entirely. So the
+      # format is checked here rather than hoped for. Headings only: what goes UNDER them is a
+      # judgement call a grep cannot make, but a missing section is unambiguous.
+      - name: Require the template's sections
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # The web editor stores CRLF and leaves trailing spaces; neither changes a heading.
+          normalised=$(printf '%s' "$BODY" | tr -d '\r' | sed 's/[[:space:]]*$//')
+          missing=()
+          while IFS= read -r heading; do
+            [ -z "$heading" ] && continue
+            grep -qxF "$heading" <<< "$normalised" || missing+=("$heading")
+          done <<'HEADINGS'
+          ## Context
+          ## Content / Changes
+          ## Test Plan
+          ### Test Details
+          ### Test Output / Feature Demonstration
+          HEADINGS
+          if [ ${#missing[@]} -gt 0 ]; then
+            printf 'PR description is missing required section(s):\n'
+            printf '  %s\n' "${missing[@]}"
+            printf '\nStart from .github/pull_request_template.md and keep every heading.\n'
+            printf 'A section that does not apply gets "N/A — <reason>", not a deletion.\n'
+            printf '\nAfter fixing the description, re-run this by toggling the automerge\n'
+            printf 'label — `edited` is deliberately not a trigger.\n'
+            exit 1
+          fi
+          echo "All required sections present."
+
+  review:
+    name: Claude review
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event.pull_request.draft == false
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    env:
+      HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+    outputs:
+      verdict: ${{ steps.verdict.outputs.value }}
+    steps:
+      - name: Fail closed when the review credential is missing
+        if: env.HAS_TOKEN != 'true'
+        run: |
+          echo "::error::CLAUDE_CODE_OAUTH_TOKEN is not available (unset, or this is a fork PR). Refusing to skip review while auto-merge is possible."
+          exit 1
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Review the PR
+        uses: anthropics/claude-code-action@c3d45e8e941e1b2ad7b278c57482d9c5bf1f35b3 # v1.0.99
+        env:
+          # Explicit gh auth: comments post as github-actions[bot], whose events can never
+          # retrigger workflows — no self-trigger loops.
+          GH_TOKEN: ${{ github.token }}
+        with:
+          # ONE credential. An unset secret renders as an empty string, and a present-but-blank
+          # API key is taken as THE credential, so passing both breaks whenever one is unset.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Its classifier authenticates with an API key only, so with an OAuth token it fails
+          # the whole job before reviewing anything. It defaults to true.
+          classify_inline_comments: false
+          prompt: |
+            Review pull request #${{ github.event.pull_request.number }} in ${{ github.repository }}.
+
+            House rules to enforce (a self-hosted model gateway for the Omnia Anki add-on, in a
+            PUBLIC repository):
+            - Layering: registry.py and config.py sit at the bottom. devices/ and engines/ hold
+              the abstractions, their registries, and the engines that run on several platforms.
+              platforms/<platform>/ holds each platform's probe and any engine that runs only
+              there, and imports only from devices/, engines/ and config. server/ and cli.py reach
+              engines and probes through the registries, never by importing a concrete class.
+            - A new engine or probe registers with its decorator, is imported by its package's
+              __init__, declares the `backends` it runs on, and gets tests in the mirrored
+              tests/ package.
+            - Security: every route except /health requires a token; tokens are stored hashed;
+              the lockout is keyed on the LAST X-Forwarded-For hop across all such headers; an
+              unauthorised request must never start a model.
+            - The repository is public: no host names, IP addresses, domains, user names, tokens
+              or other identifying data, and never files from state/, .model-cache/, bin/ or
+              deploy/*.env.
+            - Models start lazily on one device and must release it on failure, when idle, and
+              at shutdown.
+            - docs/guidance/ is user-facing usage only: no code and no test commands.
+            - Python 3.10+. Tests need no GPU and no network. New behavior needs tests; changed
+              behavior needs updated tests.
+
+            Inspect the change with `gh pr diff` and `gh pr view`, and read the surrounding
+            code in the checkout for context. Judge correctness (state a concrete failing
+            scenario for every defect you claim), architectural fit, test coverage, and the
+            house rules above.
+
+            Post your findings as a single `gh pr comment`: for a clean PR, a short summary of
+            what you checked; for a defective PR, each blocking issue with file:line, the
+            concrete failure scenario, and a suggested fix.
+
+            MANDATORY: the comment's LAST line must be exactly one of
+              VERDICT: APPROVE
+              VERDICT: BLOCKING
+            (the merge gate machine-reads it). Additionally, also write the same word to the
+            verdict file: `echo APPROVE > "$RUNNER_TEMP/verdict"` or
+            `echo BLOCKING > "$RUNNER_TEMP/verdict"`.
+            If neither the marker nor the file exists, the pipeline treats the review as BLOCKING.
+          # The reviewer is the only thing between a bad diff and an automatic merge.
+          claude_args: '--model claude-opus-5 --allowedTools "Read,Grep,Glob,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(echo:*)"'
+      - name: Publish verdict
+        id: verdict
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          v=$(cat "$RUNNER_TEMP/verdict" 2>/dev/null || true)
+          if [ -z "$v" ]; then
+            echo "No verdict file — falling back to the VERDICT marker in claude[bot]'s comments."
+            v=$(gh api "repos/$REPO/issues/$PR/comments" \
+                  --jq '[.[] | select(.user.login == "claude[bot]" or .user.login == "claude") | .body] | join("\n")' \
+                | grep -oE 'VERDICT: (APPROVE|BLOCKING)' | tail -1 | awk '{print $2}' || true)
+          fi
+          if [ "$v" != "APPROVE" ]; then v=BLOCKING; fi
+          echo "value=$v" >> "$GITHUB_OUTPUT"
+          echo "Review verdict: $v"
+
+  merge:
+    name: Auto-merge
+    needs: [test, pr-body, review]
+    if: needs.review.outputs.verdict == 'APPROVE' && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Merge when the automerge label is present
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          # Pin the merge to the exact commit this run tested and reviewed.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # Re-read labels NOW — the event payload is stale by the time review finishes.
+          labels=$(gh pr view "$PR" --repo "$REPO" --json labels --jq '.labels[].name')
+          if printf '%s\n' "$labels" | grep -qx automerge; then
+            gh pr merge "$PR" --repo "$REPO" --merge --match-head-commit "$HEAD_SHA"
+            echo "PR #$PR merged at $HEAD_SHA."
+          else
+            echo "No automerge label — review is APPROVE but merging is left to a human."
+          fi
