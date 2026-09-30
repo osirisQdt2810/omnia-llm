@@ -119,7 +119,7 @@ call POST /v1/chat/completions "$(printf '{"model":"%s","messages":[{"role":"use
 case "$CODE" in
   200) ;;
   503) fail "text" "no free GPU right now (503, Retry-After 120). Nothing is broken — try later." ;;
-  502) fail "text" "the engine failed to start: $(head -c 300 "$WORK/body"). Check disk space (df -h /home) and the host's journal." ;;
+  502) fail "text" "the engine failed: $(head -c 300 "$WORK/body"). Check disk space (df -h /home) and the host's journal." ;;
   *) fail "text" "HTTP $CODE: $(head -c 300 "$WORK/body")" ;;
 esac
 REPLY="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["choices"][0]["message"]["content"].strip()[:120])' "$WORK/body")"
