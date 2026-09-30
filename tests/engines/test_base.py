@@ -285,6 +285,15 @@ class TestItsProcesses:
         assert engine.running
         await stopping
 
+    async def test_a_stop_is_over_as_soon_as_the_engine_has_exited(self, real):
+        """Not at the end of the grace period: a /stop, and a request waiting on it, take as long
+        as the engine takes to wind down, and no longer."""
+        engine = real(SLOW_TO_EXIT)
+        await engine.ensure_running()
+        started = time.monotonic()
+        await engine.stop("asked to stop")
+        assert time.monotonic() - started < engine.shutdown_grace_seconds / 2
+
     async def test_a_second_stop_waits_for_the_first_to_finish(self, real):
         """The gateway shutting down while a /stop is under way must not leave before the old
         engine is gone: nothing would be left to finish the stop."""
