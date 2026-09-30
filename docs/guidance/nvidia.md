@@ -5,7 +5,7 @@ asked for and stops after 30 minutes without requests, handing the GPU back, so 
 that other people use too.
 
 **You need:** Linux, an NVIDIA GPU with at least 24 GB, a driver for CUDA 12.6 or newer, Python
-3.10 to 3.12, and about 25 GB of free disk for the models.
+3.10 to 3.12, and about 20 GB of free disk (the two models take about 16 GB).
 
 ## Set up
 
@@ -46,6 +46,7 @@ with:
 
 These are measured timings. After a pause, the first text answer takes about 1.5 minutes while the
 model loads, and the answers after it about half a second. The first image takes about
-20 seconds, and the next ones about 7.
+25 seconds, and the next ones about 7.
 
-In `nvidia-smi`, the running models show as `llm-engine` and `image-engine`.
+In `nvidia-smi`, the text model shows as `VLLM::EngineCore` and the image model as
+`image-engine`, with no file paths.
