@@ -1,0 +1,15 @@
+# Credentials, generated per deployment — never in the repository.
+api-key.txt
+tokens.json
+tokens.tmp
+# This deployment's public address (see ngrok.env.example).
+ngrok.env
+# ~16 GB of weights, the venvs, the ngrok binary, and the engine logs.
+hf-cache/
+.venv/
+.venv-test/
+bin/
+logs/
+__pycache__/
+.pytest_cache/
+*.bak

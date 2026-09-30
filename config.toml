@@ -1,0 +1,55 @@
+# omnia-llm gateway — the only file you normally edit.
+[gateway]
+# Qwen2.5-14B-Instruct in AWQ 4-bit: ~9 GB of weights, leaving most of a 24 GB card for KV
+# cache, which is what actually limits throughput here.
+#
+# Chosen over Qwen3-14B-AWQ deliberately. Qwen3 thinks before it answers, and Omnia asks for
+# short factual fields — a definition, an example sentence, a Vietnamese gloss — thousands of
+# times. Reasoning tokens are pure latency at that shape: no reader ever sees them, and they
+# are generated for every field of every note. Qwen2.5-Instruct answers directly.
+#
+# To use Qwen3 anyway, set BOTH of these, or the <think> block lands in the field text:
+#   model = "Qwen/Qwen3-14B-AWQ"
+#   extra_vllm_args = ["--reasoning-parser", "qwen3"]
+model = "Qwen/Qwen2.5-14B-Instruct-AWQ"
+served_model_name = "omnia-local"
+
+# Minutes with no request before the GPU is handed back. THE setting that matters to everyone
+# else on this machine.
+idle_timeout_minutes = 30.0
+
+gateway_port = 8721
+engine_port  = 8722
+
+# 4k, not 8k. Omnia fills note fields: a word plus instructions in, a sentence out — nothing
+# here needs a long context, and KV cache is the thing being traded for room to hold an image
+# model on the same card.
+max_model_len = 4096
+# Headroom on purpose. vLLM PREALLOCATES this share of the card for KV cache, so a high
+# value leaves no room for the image model that shares the GPU — and no room for a colleague's
+# stray allocation either. Volume here is modest (filling note fields, not serving traffic),
+# so a small cache costs nothing.
+# Measured, not guessed: weights are 9.5 GiB and an 8k context needs 1.5 GiB of KV cache, so
+# 0.48 (11.8 GiB) left 0.49 GiB for a cache that needed 1.5 and the engine refused to start.
+# 0.55 is 13.5 GiB — weights, a comfortable cache, and CUDA graphs — which leaves ~10 GiB of
+# the card for the image model that shares it.
+# 0.50, measured with both engines loaded. At 0.55 the pair sat at 23.9 of 24.5 GiB — 97%% of
+# a card eight people share, where one stray allocation from somebody else fails both of us.
+# 0.50 leaves ~2.7 GiB of real headroom and costs nothing at this context length.
+gpu_memory_utilization = 0.50
+
+# vLLM 0.30 logs nothing per-request by default, so there is no flag to pass here.
+extra_vllm_args = []
+
+# ── Text to image ─────────────────────────────────────────────────────────────────────────
+# SDXL-Turbo: distilled to 4 steps, ~7 GB in fp16, which is what fits BESIDE the 14 GB text
+# model on one 24 GB card. Full SDXL is better at following a long prompt and wants ~30 steps
+# and more memory; for illustrating a vocabulary word, seconds matter more than the last few
+# points of prompt adherence.
+#
+# Empty disables images entirely — /v1/images/generations then answers "not configured"
+# instead of starting 7 GB of model nobody asked for on a card other people share.
+image_model = "stabilityai/sdxl-turbo"
+image_steps = 4
+image_port = 8723
+image_required_mib = 5000
