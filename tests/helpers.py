@@ -4,11 +4,29 @@ behind them, and a model-spec builder."""
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
+import sys
 import time
 
 from omnia_llm.config import ModelSpec
 from omnia_llm.devices import Device, DeviceProbe
+
+#: A process that ignores SIGTERM, as a hung shutdown does: only SIGKILL ends it. It prints
+#: "ready" once the SIGTERM would be ignored, to its log.
+IGNORES_SIGTERM = [sys.executable, "-c", "import signal, time; "
+                   "signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); "
+                   "time.sleep(60)"]
+
+
+def group_alive(group: int) -> bool:
+    """Whether any process in ``group`` is alive. macOS answers EPERM, not ESRCH, for a group
+    left with zombies only."""
+    try:
+        os.killpg(group, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
 
 
 def free_port() -> int:

@@ -1,16 +1,28 @@
+import contextlib
 import json
+import signal
+import subprocess
 import time
 
 import httpx
 
 from omnia_llm.config import AppConfig, DevicesConfig, ModelSpec, PathsConfig, ServerConfig
 from omnia_llm.server.manager import ModelManager
-from tests.helpers import fake_lifecycle, fake_probe, gpu, until
+from tests.helpers import (
+    IGNORES_SIGTERM,
+    fake_lifecycle,
+    fake_probe,
+    free_port,
+    gpu,
+    group_alive,
+    until,
+)
 
 
 def _manager(tmp_path, *models, probe=None, server=None):
-    cfg = AppConfig(server or ServerConfig(), PathsConfig(state=tmp_path), DevicesConfig(),
-                    tuple(models))
+    cfg = AppConfig(server or ServerConfig(),
+                    PathsConfig(state=tmp_path, model_cache=tmp_path / "model-cache"),
+                    DevicesConfig(), tuple(models))
     return ModelManager(cfg, probe or fake_probe([gpu(7)]))
 
 
@@ -103,3 +115,27 @@ async def test_the_reaper_stops_a_model_left_idle(tmp_path):
         await until(lambda: not engine.running, timeout=5)
     finally:
         await m.shutdown()
+
+
+async def test_a_shutdown_during_the_reapers_stop_still_ends_the_model(tmp_path):
+    """The shutdown cancels the reaper. Cancelled mid-stop, the stop used to take the group with
+    it, and a model that ignores SIGTERM outlived the gateway, holding its memory and port."""
+    m = _manager(tmp_path, ModelSpec("omnia-local", "text", "vllm", free_port(),
+                                     options={"model": "t"}),
+                 server=ServerConfig(idle_timeout_minutes=1, reaper_interval_seconds=0.01))
+    engine = m.engines["omnia-local"]
+    engine.command = lambda device: IGNORES_SIGTERM
+    engine.shutdown_grace_seconds = 0.5
+    group = engine._launch(gpu(7))
+    try:
+        await until(lambda: "ready" in (tmp_path / "logs" / "omnia-local.log").read_text())
+        engine._last_used = time.monotonic() - 120
+        m.start_reaper()
+        await until(lambda: engine._stopping is not None)  # the reaper's stop, mid-grace
+        await m.shutdown()
+        assert not group_alive(group.leader.pid)
+    finally:
+        if group.leader.returncode is None:  # unreaped: the id is still the group's own
+            group.signal(signal.SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                group.leader.wait(timeout=5)

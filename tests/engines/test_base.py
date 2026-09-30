@@ -18,7 +18,16 @@ import pytest
 import omnia_llm.platforms  # noqa: F401 - registration
 from omnia_llm.config import ConfigError
 from omnia_llm.engines import ENGINES, EngineBusy
-from tests.helpers import fake_lifecycle, fake_probe, free_port, gpu, spec, until
+from tests.helpers import (
+    IGNORES_SIGTERM,
+    fake_lifecycle,
+    fake_probe,
+    free_port,
+    gpu,
+    group_alive,
+    spec,
+    until,
+)
 
 
 def _engine(paths, *, probe=None, ready=True, **spec_kw):
@@ -134,9 +143,6 @@ CRASHES = [sys.executable, "-c", "raise SystemExit(1)"]
 #: Exits at once, leaving a child behind in its process group, as vLLM's launcher can.
 LEAVES_A_CHILD = [sys.executable, "-c", "import subprocess, sys; "
                   "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])"]
-IGNORES_SIGTERM = [sys.executable, "-c", "import signal, time; "
-                   "signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); "
-                   "time.sleep(60)"]
 #: Answers /health on {port}, and takes a second to exit on SIGTERM, holding the port meanwhile,
 #: as vLLM does while it winds down.
 SLOW_TO_EXIT = [sys.executable, "-c", """
@@ -155,16 +161,6 @@ class Health(BaseHTTPRequestHandler):
 signal.signal(signal.SIGTERM, lambda *_: threading.Timer(1.0, os._exit, (0,)).start())
 HTTPServer(("127.0.0.1", int(sys.argv[1])), Health).serve_forever()
 """, "{port}"]
-
-
-def _alive(group: int) -> bool:
-    """Whether any process in ``group`` is alive. macOS answers EPERM, not ESRCH, for a group
-    left with zombies only."""
-    try:
-        os.killpg(group, 0)
-    except (ProcessLookupError, PermissionError):
-        return False
-    return True
 
 
 class _HungUpTerminal:
@@ -225,9 +221,9 @@ class TestItsProcesses:
         engine = real(LEAVES_A_CHILD)
         leader = engine._launch(gpu(7)).leader
         leader.wait(timeout=10)
-        assert _alive(leader.pid), "the child should outlive its leader"
+        assert group_alive(leader.pid), "the child should outlive its leader"
         await engine.stop("idle")
-        await until(lambda: not _alive(leader.pid))
+        await until(lambda: not group_alive(leader.pid))
 
     async def test_what_a_crashed_model_left_behind_is_killed_when_the_crash_is_found(self, real):
         """The instant its leader is reaped is the last at which the group's id is surely its
@@ -236,7 +232,7 @@ class TestItsProcesses:
         engine = real(LEAVES_A_CHILD)
         group = engine._launch(gpu(7)).leader.pid
         await until(lambda: not engine.running)  # as /status or the reaper would find it
-        await until(lambda: not _alive(group))
+        await until(lambda: not group_alive(group))
 
     async def test_a_crashed_model_is_never_signalled_once_it_is_reaped(self, real):
         """Reaping the leader frees its pid, and the kernel may give it to any new process group
@@ -262,7 +258,7 @@ class TestItsProcesses:
         group = engine._launch(gpu(7)).leader.pid
         await until(lambda: "ready" in (paths.logs / "omnia-local.log").read_text())
         await engine.stop("idle")
-        assert not _alive(group)
+        assert not group_alive(group)
 
     async def test_a_terminal_that_went_away_does_not_interrupt_a_stop(self, real, monkeypatch):
         """Closing the terminal is the SIGHUP that starts a shutdown, and from then on a print
@@ -272,7 +268,7 @@ class TestItsProcesses:
         group = engine._launch(gpu(7)).leader.pid
         monkeypatch.setattr(sys, "stdout", _HungUpTerminal())
         await engine.stop("gateway shutting down")
-        await until(lambda: not _alive(group))
+        await until(lambda: not group_alive(group))
 
     async def test_a_request_during_a_stop_waits_for_the_old_engine_to_go(self, real):
         """A /stop does not take the lock. Let through at once, the next request found the old
@@ -293,6 +289,23 @@ class TestItsProcesses:
         started = time.monotonic()
         await engine.stop("asked to stop")
         assert time.monotonic() - started < engine.shutdown_grace_seconds / 2
+
+    async def test_a_request_given_up_during_a_stop_leaves_the_stop_running(self, real, paths):
+        """A client that goes away cancels its request. Waiting on the stop, the request must
+        not take the stop with it, or a model ignoring SIGTERM is never killed."""
+        engine = real(IGNORES_SIGTERM)
+        engine.shutdown_grace_seconds = 0.5
+        group = engine._launch(gpu(7))
+        await until(lambda: "ready" in (paths.logs / "omnia-local.log").read_text())
+        stopping = asyncio.create_task(engine.stop("asked to stop"))
+        await until(lambda: engine._stopping is not None)
+        request = asyncio.create_task(engine.ensure_running())
+        await asyncio.sleep(0.05)
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        await stopping
+        assert not group_alive(group.leader.pid)
 
     async def test_a_second_stop_waits_for_the_first_to_finish(self, real):
         """The gateway shutting down while a /stop is under way must not leave before the old

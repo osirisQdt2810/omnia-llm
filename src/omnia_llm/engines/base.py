@@ -240,8 +240,9 @@ class ProcessEngine(Engine):
         self._group: Optional[_ProcessGroup] = None
         self._device: Optional[Device] = None
         self._lock = asyncio.Lock()
-        #: Set while a stop is under way: a /stop and the shutdown do not take the lock.
-        self._stopping: Optional[asyncio.Event] = None
+        #: The task ending the last run, while it does: a /stop and the shutdown do not take the
+        #: lock, and whoever started it may be cancelled before it is done.
+        self._stopping: Optional[asyncio.Task] = None
         self._last_used = 0.0
         self._started_at = 0.0
         self._starting = False
@@ -316,7 +317,7 @@ class ProcessEngine(Engine):
             if self._stopping is not None:
                 # A /stop is still ending the last run, whose processes hold the port and the
                 # device until they are gone: started now, this would fail on the port.
-                await self._stopping.wait()
+                await asyncio.shield(self._stopping)
             if self._group is not None:
                 # It exited on its own (a crash, the OOM killer), and what it left behind was
                 # killed when that was found: only its bookkeeping is left to clear.
@@ -403,20 +404,27 @@ class ProcessEngine(Engine):
     async def stop(self, reason: str) -> None:
         """End the process GROUP: SIGTERM, then SIGKILL once the grace period is up.
 
-        The group, not only the leader: a worker left running keeps the device's memory, which
-        would defeat the idle timer. A group that is already over (see :class:`_ProcessGroup`)
-        is not signalled at all, and only its bookkeeping is cleared. Killed first, logged
-        after (see :func:`_say`).
+        The ending runs as a task of its own, which every later stop and start waits for:
+        whoever asked for it may be cancelled before it is done (a shutdown cancels the reaper
+        mid-stop), and the group must end all the same. A stop that finds the group already
+        taken waits for the same task, so a shutdown arriving during a /stop does not leave
+        before the old engine is gone.
         """
         group, self._group = self._group, None
         device, self._device = self._device, None
-        if group is None:
-            if self._stopping is not None:
-                # Another stop has the group: done is when that one is, or a shutdown arriving
-                # during a /stop would leave the old engine to nobody.
-                await self._stopping.wait()
-            return
-        stopped = self._stopping = asyncio.Event()
+        if group is not None:
+            self._stopping = asyncio.ensure_future(self._end(group, device, reason))
+        if self._stopping is not None:
+            # Shielded: a caller cancelled here leaves the ending running.
+            await asyncio.shield(self._stopping)
+
+    async def _end(self, group: _ProcessGroup, device: Optional[Device], reason: str) -> None:
+        """SIGTERM the group, and SIGKILL it once the grace period is up.
+
+        The group, not only the leader: a worker left running keeps the device's memory, which
+        would defeat the idle timer. A group already over (see :class:`_ProcessGroup`) gets no
+        signal at all. Killed first, logged after (see :func:`_say`).
+        """
         try:
             group.signal(signal.SIGTERM)
             _say(f"[{self.id}] stopping ({device.id if device else '?'}): {reason}")
@@ -425,8 +433,7 @@ class ProcessEngine(Engine):
                 # SIGKILL cannot be refused: this only waits for the leader to go, and reaps it.
                 await group.exited(within=5.0)
         finally:
-            stopped.set()
-            if self._stopping is stopped:
+            if self._stopping is asyncio.current_task():
                 self._stopping = None
 
     # --- traffic -----------------------------------------------------------------------------
