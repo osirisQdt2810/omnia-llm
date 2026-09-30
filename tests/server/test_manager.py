@@ -1,12 +1,11 @@
-from conftest import FakeProbe, gpu
-
-from omnia_llm.config import AppConfig, ModelSpec, PathsConfig, ServerConfig, DevicesConfig
+from omnia_llm.config import AppConfig, DevicesConfig, ModelSpec, PathsConfig, ServerConfig
 from omnia_llm.server.manager import ModelManager
+from tests.helpers import fake_probe, gpu
 
 
 def _manager(tmp_path, *models):
     cfg = AppConfig(ServerConfig(), PathsConfig(state=tmp_path), DevicesConfig(), tuple(models))
-    return ModelManager(cfg, FakeProbe([gpu(7)]))
+    return ModelManager(cfg, fake_probe([gpu(7)]))
 
 
 TEXT = ModelSpec("omnia-local", "text", "vllm", 8722, options={"model": "t"})

@@ -1,4 +1,4 @@
-"""Engines: the lazy lifecycle (start on demand, once; stop when idle) and each backend's command."""
+"""Engines: the lazy lifecycle (start on demand, once; stop when idle), options and platform checks."""
 
 from __future__ import annotations
 
@@ -8,11 +8,11 @@ import sys
 import time
 
 import pytest
-from conftest import FakeProbe, gpu, spec
 
 import omnia_llm.platforms  # noqa: F401 - registration
 from omnia_llm.config import ConfigError
 from omnia_llm.engines import ENGINES, EngineBusy
+from tests.helpers import fake_probe, gpu, spec
 
 
 class _FakeProcess:
@@ -29,7 +29,7 @@ class _FakeProcess:
 
 def _engine(paths, *, probe=None, ready=True, **spec_kw):
     s = spec(**spec_kw)
-    engine = ENGINES.get(s.engine)(s, probe or FakeProbe([gpu(7)]), paths)
+    engine = ENGINES.get(s.engine)(s, probe or fake_probe([gpu(7)]), paths)
     launched = []
 
     def launch(device):
@@ -93,12 +93,12 @@ class TestItStartsOnlyWhenAsked:
         assert launched == ["nvidia:7"]
 
     async def test_every_card_busy_is_a_plain_refusal(self, paths):
-        engine, _ = _engine(paths, probe=FakeProbe([gpu(0, busy=True)]))
+        engine, _ = _engine(paths, probe=fake_probe([gpu(0, busy=True)]))
         with pytest.raises(EngineBusy):
             await engine.ensure_running()
 
     async def test_it_prefers_the_card_another_model_holds(self, paths):
-        probe = FakeProbe([gpu(2), gpu(7, used=13800, busy=True)])
+        probe = fake_probe([gpu(2), gpu(7, used=13800, busy=True)])
         engine, launched = _engine(paths, probe=probe, required_mib=5000)
         await engine.ensure_running(prefer=["nvidia:7"])
         assert launched == ["nvidia:7"]
@@ -139,69 +139,30 @@ class TestItGivesTheCardBack:
 class TestConfigIsChecked:
     def test_an_engine_refuses_a_platform_it_does_not_run_on(self, paths):
         with pytest.raises(ConfigError, match="runs on apple"):
-            ENGINES.get("mlx")(spec(engine="mlx"), FakeProbe(backend="nvidia"), paths)
+            ENGINES.get("mlx")(spec(engine="mlx"), fake_probe(backend="nvidia"), paths)
 
     def test_an_unknown_option_is_refused(self, paths):
         with pytest.raises(ConfigError, match="unknown option"):
-            ENGINES.get("vllm")(spec(max_len=9), FakeProbe(), paths)
+            ENGINES.get("vllm")(spec(max_len=9), fake_probe(), paths)
 
     def test_a_missing_required_option_is_refused(self, paths):
         s = spec()
         s.options.pop("model")
         with pytest.raises(ConfigError):
-            ENGINES.get("vllm")(s, FakeProbe(), paths)
+            ENGINES.get("vllm")(s, fake_probe(), paths)
 
 
-class TestCommands:
-    def test_vllm_serves_under_the_client_id_on_one_card(self, paths):
-        engine, _ = _engine(paths)
-        argv = engine.command(gpu(7))
-        assert argv[1:5] == ["-m", "omnia_llm.workers.titled", "llm-engine",
-                             "vllm.entrypoints.cli.main"]
-        assert argv[argv.index("--served-model-name") + 1] == "omnia-local"
-        assert argv[argv.index("--tensor-parallel-size") + 1] == "1"
-
-    def test_diffusers_is_told_the_device_kind(self, paths):
-        engine = ENGINES.get("diffusers")(spec(id="img", kind="image", engine="diffusers"),
-                                          FakeProbe(), paths)
-        argv = engine.command(gpu(7))
-        assert argv[3] == "image-engine" and argv[argv.index("--device") + 1] == "nvidia"
-
-    def test_mlx_always_asks_for_the_model_it_loaded(self, paths):
-        """mlx_lm.server would LOAD an unknown model name — so every request is rewritten."""
-        engine = ENGINES.get("mlx")(spec(engine="mlx", model="mlx-community/x-4bit"),
-                                    FakeProbe(backend="apple"), paths)
-        assert b'"model": "mlx-community/x-4bit"' in engine.rewrite(b'{"model": "omnia-local"}')
-
-    def test_llamacpp_uses_no_gpu_layers_on_a_cpu(self, paths):
-        from omnia_llm.devices import Device
-
-        engine = ENGINES.get("llamacpp")(spec(engine="llamacpp", model="m.gguf", gpu_layers=99),
-                                         FakeProbe(backend="cpu"), paths)
-        cpu = Device(backend="cpu", index=0, name="cpu", memory_total_mib=1, exclusive=True)
-        argv = engine.command(cpu)
-        assert argv[argv.index("-ngl") + 1] == "0" and argv[argv.index("--alias") + 1] == "omnia-local"
-
-    def test_llamacpp_downloads_into_the_model_cache_too(self, paths):
-        engine = ENGINES.get("llamacpp")(spec(engine="llamacpp", hf_repo="x/y-GGUF:Q4_K_M"),
-                                         FakeProbe(backend="cpu"), paths)
-        env = engine.environment(gpu(0))
-        assert env["LLAMA_CACHE"] == str(paths.model_cache / "llama.cpp")
-
+class TestTheChild:
     def test_the_child_is_pinned_and_keeps_weights_in_state(self, paths):
         engine, _ = _engine(paths)
         env = engine.environment(gpu(3))
         assert env["CUDA_VISIBLE_DEVICES"] == "3" and env["HF_HOME"] == str(paths.hf_home)
 
-    def test_a_body_that_is_not_json_is_forwarded_untouched(self, paths):
-        engine = ENGINES.get("mlx")(spec(engine="mlx"), FakeProbe(backend="apple"), paths)
-        assert engine.rewrite(b"not json") == b"not json"
-
 
 def test_starting_a_model_leaks_no_file_descriptor(paths, monkeypatch):
     """The parent must not hold the log open: the child has its own copy, and a descriptor kept
     per start would run a gateway that restarts idle models all day out of them."""
-    engine = ENGINES.get("vllm")(spec(), FakeProbe([gpu(7)]), paths)
+    engine = ENGINES.get("vllm")(spec(), fake_probe([gpu(7)]), paths)
     sleeper = [sys.executable, "-c", "import time; time.sleep(30)"]
     monkeypatch.setattr(engine, "command", lambda device: sleeper)
     before = len(os.listdir("/dev/fd"))

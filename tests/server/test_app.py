@@ -1,19 +1,19 @@
 """The HTTP gateway: what is open, what needs a token, and the lockout."""
 
 import pytest
-from conftest import FakeProbe, gpu
 from fastapi.testclient import TestClient
 
 from omnia_llm.config import AppConfig, DevicesConfig, ModelSpec, PathsConfig, ServerConfig
 from omnia_llm.server.app import create_app
 from omnia_llm.server.lockout import MAX_FAILURES
+from tests.helpers import fake_probe, gpu
 
 
 @pytest.fixture
 def client(tmp_path):
     cfg = AppConfig(ServerConfig(), PathsConfig(state=tmp_path / "state"), DevicesConfig(),
                     (ModelSpec("omnia-local", "text", "vllm", 8722, options={"model": "t"}),))
-    app = create_app(cfg, FakeProbe([gpu(7)]))
+    app = create_app(cfg, fake_probe([gpu(7)]))
     token = app.state.tokens.issue("tester")
     return TestClient(app), token
 
@@ -63,7 +63,7 @@ model = "t"
 
 
 def _restart(config_file):
-    return TestClient(create_app(AppConfig.load(config_file), FakeProbe([gpu(7)])))
+    return TestClient(create_app(AppConfig.load(config_file), fake_probe([gpu(7)])))
 
 
 def test_a_new_install_accepts_no_token_it_did_not_issue(tmp_path):
@@ -121,7 +121,7 @@ def test_another_client_is_not_locked_out_by_one_guesser(client):
 def test_a_gateway_going_away_gives_its_devices_back(tmp_path):
     cfg = AppConfig(ServerConfig(), PathsConfig(state=tmp_path / "state"), DevicesConfig(),
                     (ModelSpec("omnia-local", "text", "vllm", 8722, options={"model": "t"}),))
-    app = create_app(cfg, FakeProbe([gpu(7)]))
+    app = create_app(cfg, fake_probe([gpu(7)]))
     stopped = []
 
     async def stop(reason):

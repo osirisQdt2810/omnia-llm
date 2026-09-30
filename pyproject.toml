@@ -33,3 +33,10 @@ where = ["src"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E9", "F", "B", "SIM", "I"]
+ignore = ["SIM108", "SIM117"]
