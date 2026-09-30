@@ -121,7 +121,7 @@ class AppConfig:
         if unknown:
             raise ConfigError(f"unknown section(s): {', '.join(sorted(unknown))}")
         server = _build(ServerConfig, data.get("server", {}), "server")
-        _check_port(server.port, "[server]")
+        _check_whole(server.port, "[server]", "port", 1, 65535)
         for name in ("idle_timeout_minutes", "reaper_interval_seconds"):
             _check_positive(getattr(server, name), "[server]", name)
         paths_raw = dict(data.get("paths", {}))
@@ -157,10 +157,12 @@ def _build(cls: type, raw: dict[str, Any], where: str):
     return cls(**raw)
 
 
-def _check_port(value: Any, where: str) -> None:
+def _check_whole(value: Any, where: str, name: str, low: int, high: Optional[int] = None) -> None:
     # A bool is an int to Python, and `port = true` is not a port.
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
-        raise ConfigError(f"{where}: port must be a whole number from 1 to 65535, not {value!r}")
+    if (isinstance(value, bool) or not isinstance(value, int) or value < low
+            or (high is not None and value > high)):
+        span = f"from {low} to {high}" if high is not None else f"of {low} or more"
+        raise ConfigError(f"{where}: {name} must be a whole number {span}, not {value!r}")
 
 
 def _check_positive(value: Any, where: str, name: str) -> None:
@@ -180,6 +182,8 @@ def _model(raw: dict[str, Any], index: int) -> ModelSpec:
                           "or '-', starting with a letter or digit: it names the model's log file")
     if raw["kind"] not in KINDS:
         raise ConfigError(f"{where}: kind must be one of {KINDS}, not {raw['kind']!r}")
-    _check_port(raw["port"], where)
+    _check_whole(raw["port"], where, "port", 1, 65535)
+    # Compared with each device's free memory at every start: a string there fails them all.
+    _check_whole(raw.get("required_mib", 0), where, "required_mib", 0)
     spec = _build(ModelSpec, raw, where)
     return dataclasses.replace(spec, options=dict(spec.options))

@@ -109,14 +109,20 @@ def _models(args: argparse.Namespace) -> int:
     mistakes = []
     for spec in config.models:
         cls = ENGINES.get(spec.engine)
+        # As `serve` will check it: a mistake shows here, not in a service's restart loop.
+        wrong = []
         try:
-            cls.check_options(spec)  # as `serve` will: a mistake shows here, not at start
+            cls.check_platform(spec, backend)
         except ConfigError as exc:
+            wrong.append(f"NOT on {backend}")
             mistakes.append(str(exc))
-            fits = "options wrong"
-        else:
-            fits = "ok" if backend in cls.backends else f"NOT on {backend}"
-        print(f"  {spec.id:{width}} {spec.kind:6} {spec.engine:10} port {spec.port}  [{fits}]")
+        try:
+            cls.check_options(spec)
+        except ConfigError as exc:
+            wrong.append("options wrong")
+            mistakes.append(str(exc))
+        print(f"  {spec.id:{width}} {spec.kind:6} {spec.engine:10} port {spec.port}  "
+              f"[{', '.join(wrong) or 'ok'}]")
     for mistake in mistakes:
         print(f"omnia-llm: {mistake}", file=sys.stderr)
     return 1 if mistakes else 0

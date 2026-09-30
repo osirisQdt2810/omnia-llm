@@ -144,17 +144,22 @@ class Engine(abc.ABC):
     registry_name: ClassVar[str] = ""
 
     def __init__(self, spec: ModelSpec, probe: DeviceProbe, paths: PathsConfig) -> None:
-        backend = type(probe).registry_name
-        if backend not in self.backends:
-            raise ConfigError(
-                f"model {spec.id!r}: engine {spec.engine!r} runs on "
-                f"{', '.join(self.backends) or 'nothing'}, but this machine's devices are "
-                f"{backend!r} — pick another engine, or set [devices] probe"
-            )
+        self.check_platform(spec, type(probe).registry_name)
         self.spec = spec
         self.probe = probe
         self.paths = paths
         self.options = self.check_options(spec)
+
+    @classmethod
+    def check_platform(cls, spec: ModelSpec, backend: str) -> None:
+        """Refuse ``spec`` on a machine whose devices are ``backend``, if this engine does not
+        run there. Public, like :meth:`check_options`, so ``omnia-llm models`` refuses it too."""
+        if backend not in cls.backends:
+            raise ConfigError(
+                f"model {spec.id!r}: engine {spec.engine!r} runs on "
+                f"{', '.join(cls.backends) or 'nothing'}, but this machine's devices are "
+                f"{backend!r} — pick another engine, or set [devices] probe"
+            )
 
     @classmethod
     def check_options(cls, spec: ModelSpec) -> Any:

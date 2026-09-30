@@ -95,6 +95,17 @@ def test_a_model_port_out_of_range_is_refused(port):
         AppConfig.from_dict(_cfg(models=[_model(port=port)]))
 
 
+@pytest.mark.parametrize("required", ["14500", -1, 1.5, True])
+def test_the_memory_a_model_needs_is_a_whole_number(required):
+    """Accepted as "14500", it loaded, and then every start failed comparing it with a number."""
+    with pytest.raises(ConfigError, match="required_mib"):
+        AppConfig.from_dict(_cfg(models=[_model(required_mib=required)]))
+
+
+def test_a_model_may_need_no_memory_at_all():
+    assert AppConfig.from_dict(_cfg(models=[_model(required_mib=0)])).models[0].required_mib == 0
+
+
 def test_fractional_minutes_are_fine():
     cfg = AppConfig.from_dict(_cfg(server={"port": 8721, "idle_timeout_minutes": 0.5}))
     assert cfg.server.idle_timeout_seconds == 30.0

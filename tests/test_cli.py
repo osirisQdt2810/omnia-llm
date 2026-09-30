@@ -23,7 +23,7 @@ def test_tokens_need_no_config_while_state_is_where_it_always_is(tmp_path, monke
     assert token and (tmp_path / "state" / "tokens.json").is_file()
 
 
-def _models_config(tmp_path, **options):
+def _models_config(tmp_path, engine="llamacpp", **options):
     path = tmp_path / "models.toml"
     table = "\n".join(f"{key} = {value!r}" for key, value in options.items())
     path.write_text(f"""
@@ -33,7 +33,7 @@ probe = "cpu"
 [[models]]
 id = "m"
 kind = "text"
-engine = "llamacpp"
+engine = "{engine}"
 port = 8742
 [models.options]
 {table}
@@ -46,6 +46,14 @@ def test_models_names_an_option_serve_would_refuse(tmp_path, capsys):
     config_file = _models_config(tmp_path, model="m.gguf", ctx_sise=4096)
     assert cli.main(["models", "-c", str(config_file)]) == 1
     assert "ctx_sise" in capsys.readouterr().err
+
+
+def test_models_counts_a_model_this_machine_cannot_run_as_a_mistake(tmp_path, capsys):
+    """`serve` refuses it on this machine: the same restart loop as a typo."""
+    config_file = _models_config(tmp_path, engine="vllm", model="x")
+    assert cli.main(["models", "-c", str(config_file)]) == 1
+    captured = capsys.readouterr()
+    assert "[NOT on cpu]" in captured.out and "runs on nvidia, rocm" in captured.err
 
 
 def test_models_passes_a_config_serve_would_run(tmp_path, capsys):
