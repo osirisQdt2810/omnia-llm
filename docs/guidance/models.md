@@ -16,7 +16,7 @@ model, and Omnia lists it under its `id`.
 |---|---|---|---|
 | `mlx` | Mac | An MLX model from Hugging Face, such as those under `mlx-community` | `max_tokens` |
 | `vllm` | NVIDIA, AMD | A Hugging Face model | `max_model_len`, `gpu_memory_utilization` |
-| `llamacpp` | Every platform | A local `.gguf` file, or `hf_repo = "<repo>:<quantization>"` instead | `ctx_size`, `gpu_layers`, `binary` |
+| `llamacpp` | Every platform | A local `.gguf` file, or `hf_repo = "<repo>:<quantization>"` instead. With both, `model` names a file in that repo | `ctx_size`, `gpu_layers`, `binary` |
 | `diffusers` | NVIDIA, AMD (Mac and CPU untried) | A Hugging Face image model | `steps`, `cpu_offload` |
 
 ## Examples

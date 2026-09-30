@@ -105,11 +105,21 @@ def _models(args: argparse.Namespace) -> int:
 
     config = _config(args.config)
     backend = type(detect(config.devices.probe)).registry_name
+    width = max(len(spec.id) for spec in config.models)
+    mistakes = []
     for spec in config.models:
         cls = ENGINES.get(spec.engine)
-        fits = "ok" if backend in cls.backends else f"NOT on {backend}"
-        print(f"  {spec.id:18} {spec.kind:6} {spec.engine:10} port {spec.port}  [{fits}]")
-    return 0
+        try:
+            cls.check_options(spec)  # as `serve` will: a mistake shows here, not at start
+        except ConfigError as exc:
+            mistakes.append(str(exc))
+            fits = "options wrong"
+        else:
+            fits = "ok" if backend in cls.backends else f"NOT on {backend}"
+        print(f"  {spec.id:{width}} {spec.kind:6} {spec.engine:10} port {spec.port}  [{fits}]")
+    for mistake in mistakes:
+        print(f"omnia-llm: {mistake}", file=sys.stderr)
+    return 1 if mistakes else 0
 
 
 def main(argv: list[str] | None = None) -> int:

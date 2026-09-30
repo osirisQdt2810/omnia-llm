@@ -24,6 +24,11 @@ class LlamaCppOptions:
     gpu_layers: int = 0
     extra_args: tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        if not (self.model or self.hf_repo):
+            raise ValueError('no model to serve: set hf_repo = "<repo>:<quantization>", or '
+                             'model = "<path to a .gguf file>"')
+
 
 @register_engine("llamacpp")
 class LlamaCppEngine(ProcessEngine):
@@ -32,7 +37,12 @@ class LlamaCppEngine(ProcessEngine):
 
     def command(self, device: Device) -> list[str]:
         o = self.options
-        source = ["-hf", o.hf_repo] if o.hf_repo else ["-m", o.model]
+        if o.hf_repo:
+            # ``model`` then names a file in the repo (-hff); left out, llama-server takes the
+            # file the repo's quantization tag names.
+            source = ["-hf", o.hf_repo, *(["-hff", o.model] if o.model else [])]
+        else:
+            source = ["-m", o.model]
         return [
             o.binary, *source, "--host", "127.0.0.1", "--port", str(self.spec.port),
             "--alias", self.id, "-c", str(o.ctx_size),

@@ -9,6 +9,7 @@ never runs.
 from __future__ import annotations
 
 import dataclasses
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -19,6 +20,8 @@ except ModuleNotFoundError:  # pragma: no cover - depends on the interpreter
 
 ROOT = Path(__file__).resolve().parents[2]
 KINDS = ("text", "image")
+#: A model's id names its log file, so it is held to what is safe in one.
+_MODEL_ID = r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
 
 
 class ConfigError(ValueError):
@@ -118,6 +121,9 @@ class AppConfig:
         if unknown:
             raise ConfigError(f"unknown section(s): {', '.join(sorted(unknown))}")
         server = _build(ServerConfig, data.get("server", {}), "server")
+        _check_port(server.port, "[server]")
+        for name in ("idle_timeout_minutes", "reaper_interval_seconds"):
+            _check_positive(getattr(server, name), "[server]", name)
         paths_raw = dict(data.get("paths", {}))
         for key in ("state", "model_cache"):
             if key in paths_raw:
@@ -151,12 +157,29 @@ def _build(cls: type, raw: dict[str, Any], where: str):
     return cls(**raw)
 
 
+def _check_port(value: Any, where: str) -> None:
+    # A bool is an int to Python, and `port = true` is not a port.
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
+        raise ConfigError(f"{where}: port must be a whole number from 1 to 65535, not {value!r}")
+
+
+def _check_positive(value: Any, where: str, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0:
+        raise ConfigError(f"{where}: {name} must be a number above 0, not {value!r}")
+
+
 def _model(raw: dict[str, Any], index: int) -> ModelSpec:
     where = f"[[models]] #{index + 1}"
     for key in ("id", "kind", "engine", "port"):
         if key not in raw:
             raise ConfigError(f"{where}: missing {key!r}")
+    model_id = raw["id"]
+    if not isinstance(model_id, str) or not re.fullmatch(_MODEL_ID, model_id):
+        # Accepted, "Qwen/Qwen2.5-1.5B" loads, and then every start fails to open its log.
+        raise ConfigError(f"{where}: id {model_id!r} must be 1 to 64 letters, digits, '.', '_' "
+                          "or '-', starting with a letter or digit: it names the model's log file")
     if raw["kind"] not in KINDS:
         raise ConfigError(f"{where}: kind must be one of {KINDS}, not {raw['kind']!r}")
+    _check_port(raw["port"], where)
     spec = _build(ModelSpec, raw, where)
     return dataclasses.replace(spec, options=dict(spec.options))

@@ -303,6 +303,32 @@ class TestConfigIsChecked:
         with pytest.raises(ConfigError):
             ENGINES.get("vllm")(s, fake_probe(), paths)
 
+    def test_a_list_option_is_read_as_a_tuple(self, paths):
+        engine = ENGINES.get("vllm")(spec(extra_args=["--enforce-eager"]), fake_probe(), paths)
+        assert engine.options.extra_args == ("--enforce-eager",)
+
+    @pytest.mark.parametrize("options", [
+        {"extra_args": "--threads 4"},  # split into characters, it would pass eleven arguments
+        {"extra_args": ["--threads", 4]},
+        {"max_model_len": "4096"},
+        {"max_model_len": 4096.0},
+        {"max_model_len": True},
+        {"gpu_memory_utilization": "0.5"},
+        {"model": 14},
+    ])
+    def test_an_option_of_the_wrong_type_is_refused(self, paths, options):
+        with pytest.raises(ConfigError, match=f"option {next(iter(options))!r} must be"):
+            ENGINES.get("vllm")(spec(**options), fake_probe(), paths)
+
+    def test_a_switch_takes_true_or_false_only(self, paths):
+        with pytest.raises(ConfigError, match="true or false"):
+            ENGINES.get("diffusers")(spec(kind="image", engine="diffusers", cpu_offload="no"),
+                                     fake_probe(), paths)
+
+    def test_a_whole_number_is_a_fine_fraction(self, paths):
+        engine = ENGINES.get("vllm")(spec(gpu_memory_utilization=1), fake_probe(), paths)
+        assert isinstance(engine.options.gpu_memory_utilization, float)
+
 
 class TestTheChild:
     def test_the_child_is_pinned_and_keeps_weights_in_the_model_cache(self, paths):

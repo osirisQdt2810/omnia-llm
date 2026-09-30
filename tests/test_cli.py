@@ -23,6 +23,36 @@ def test_tokens_need_no_config_while_state_is_where_it_always_is(tmp_path, monke
     assert token and (tmp_path / "state" / "tokens.json").is_file()
 
 
+def _models_config(tmp_path, **options):
+    path = tmp_path / "models.toml"
+    table = "\n".join(f"{key} = {value!r}" for key, value in options.items())
+    path.write_text(f"""
+[devices]
+probe = "cpu"
+
+[[models]]
+id = "m"
+kind = "text"
+engine = "llamacpp"
+port = 8742
+[models.options]
+{table}
+""", encoding="utf-8")
+    return path
+
+
+def test_models_names_an_option_serve_would_refuse(tmp_path, capsys):
+    """Passed here and refused by `serve`, a typo is a service in a restart loop."""
+    config_file = _models_config(tmp_path, model="m.gguf", ctx_sise=4096)
+    assert cli.main(["models", "-c", str(config_file)]) == 1
+    assert "ctx_sise" in capsys.readouterr().err
+
+
+def test_models_passes_a_config_serve_would_run(tmp_path, capsys):
+    assert cli.main(["models", "-c", str(_models_config(tmp_path, model="m.gguf"))]) == 0
+    assert "[ok]" in capsys.readouterr().out
+
+
 def _gateway_config(tmp_path, port):
     path = tmp_path / "gateway.toml"
     path.write_text(f"""

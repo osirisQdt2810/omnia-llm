@@ -23,6 +23,7 @@ import socket
 import subprocess
 import sys
 import time
+import typing
 from typing import Any, ClassVar, Iterable, Optional
 
 import httpx
@@ -88,6 +89,41 @@ class NoOptions:
     """For an engine that takes none."""
 
 
+#: What an option of each type takes, in the words an error uses.
+_WANTED = {bool: "true or false", int: "a whole number", float: "a number", str: "a string"}
+
+
+def _fits(hint: Any, value: Any) -> bool:
+    """Whether a value, as TOML gives it, is a ``hint``: a bool is no number here, whatever
+    Python's subclassing says, and a whole number is a fine float."""
+    if isinstance(value, bool):
+        return hint is bool
+    return isinstance(value, (int, float) if hint is float else hint)
+
+
+def _option(where: str, name: str, hint: Any, value: Any) -> Any:
+    """``value`` as the option ``name``, of type ``hint``, takes it.
+
+    A list becomes a tuple where the option is one, and a whole number a float. Nothing else is
+    converted: a string where a list belongs is refused, not split into characters.
+
+    Raises:
+        ConfigError: naming the option and what it takes.
+    """
+    if typing.get_origin(hint) is tuple:
+        item = typing.get_args(hint)[0]
+        if isinstance(value, (list, tuple)) and all(_fits(item, v) for v in value):
+            return tuple(value)
+        wanted = f"a list, each item {_WANTED[item]}"
+    elif hint in _WANTED:
+        if _fits(hint, value):
+            return float(value) if hint is float else value
+        wanted = _WANTED[hint]
+    else:
+        return value  # a type with no rule here is the engine's own business
+    raise ConfigError(f"{where}: option {name!r} must be {wanted}, not {value!r}")
+
+
 class Engine(abc.ABC):
     """One served model. The gateway talks only to this interface."""
 
@@ -108,21 +144,30 @@ class Engine(abc.ABC):
         self.spec = spec
         self.probe = probe
         self.paths = paths
-        self.options = self._parse_options(spec)
+        self.options = self.check_options(spec)
 
     @classmethod
-    def _parse_options(cls, spec: ModelSpec) -> Any:
-        known = {f.name for f in dataclasses.fields(cls.Options)}
-        unknown = set(spec.options) - known
+    def check_options(cls, spec: ModelSpec) -> Any:
+        """``spec``'s options as this engine's ``Options``, or ConfigError naming the mistake.
+
+        Public so that ``omnia-llm models`` checks a config exactly as ``serve`` will: a mistake
+        that passes the one and fails the other is a service in a restart loop.
+        """
+        where = f"model {spec.id!r} ({spec.engine})"
+        hints = typing.get_type_hints(cls.Options)
+        known = {f.name: hints[f.name] for f in dataclasses.fields(cls.Options)}
+        unknown = set(spec.options) - set(known)
         if unknown:
             raise ConfigError(
-                f"model {spec.id!r} ({spec.engine}): unknown option(s) "
-                f"{', '.join(sorted(unknown))}; known: {', '.join(sorted(known)) or 'none'}"
+                f"{where}: unknown option(s) {', '.join(sorted(unknown))}; "
+                f"known: {', '.join(sorted(known)) or 'none'}"
             )
+        values = {name: _option(where, name, known[name], value)
+                  for name, value in spec.options.items()}
         try:
-            return cls.Options(**spec.options)
-        except TypeError as exc:  # a required option is missing
-            raise ConfigError(f"model {spec.id!r} ({spec.engine}): {exc}") from None
+            return cls.Options(**values)
+        except (TypeError, ValueError) as exc:  # a required option missing; a bad combination
+            raise ConfigError(f"{where}: {exc}") from None
 
     @property
     def id(self) -> str:
