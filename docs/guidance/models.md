@@ -1,11 +1,12 @@
 # Change or add models
 
 What omnia-llm serves is set by a config file in `configs/`. Each `[[models]]` block in it is one
-model, and Omnia lists it under its `id`.
+model, and Omnia lists it under its `id`. The ready-made configs name each model after itself,
+such as `qwen2.5-14b-instruct-awq`.
 
 | Setting | Meaning |
 |---|---|
-| `id` | The name Omnia shows, and sends back when it asks for this model |
+| `id` | The name Omnia shows, and sends back when it asks for this model. Letters, digits, `.`, `_` and `-` only |
 | `kind` | `text` or `image` |
 | `engine` | What runs the model (see below) |
 | `port` | A free local port, used by this model only |
@@ -22,8 +23,9 @@ model, and Omnia lists it under its `id`.
 ## Examples
 
 - **A larger model on a Mac with 16 GB.** In `configs/mac-mlx-small.toml`, set
-  `model = "mlx-community/Qwen2.5-7B-Instruct-4bit"` (about 4.3 GB). Keep the `id`, or change it
-  and pick the new name in Omnia.
+  `model = "mlx-community/Qwen2.5-7B-Instruct-4bit"` (about 4.3 GB), and `id` to its name,
+  `qwen2.5-7b-instruct-4bit`. Then pick the new name in Omnia. Until you do, Omnia's requests
+  under the old name still reach the text model.
 - **A second text model.** Add another `[[models]]` block with its own `id` and `port`. Omnia then
   lists both.
 

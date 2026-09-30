@@ -36,4 +36,4 @@ with:
 |---|---|
 | Base URL | `http://127.0.0.1:8741/v1` |
 | API key | your token |
-| Text model | `qwen2.5-1.5b` |
+| Text model | `qwen2.5-1.5b-instruct-q4_k_m` |

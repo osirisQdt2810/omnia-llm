@@ -32,6 +32,6 @@ with:
 |---|---|
 | Base URL | `http://127.0.0.1:8731/v1` |
 | API key | your token |
-| Text model | `qwen2.5-1.5b` (press ↻ Load models and pick it) |
+| Text model | `qwen2.5-1.5b-instruct-4bit` (press ↻ Load models and pick it) |
 
 For better answers from a larger model, see [change or add models](models.md).

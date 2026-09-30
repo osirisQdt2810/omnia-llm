@@ -14,7 +14,7 @@ state = "state"
 probe = "cpu"
 
 [[models]]
-id = "qwen2.5-1.5b"
+id = "qwen2.5-1.5b-instruct-q4_k_m"
 kind = "text"
 engine = "llamacpp"
 port = 8742

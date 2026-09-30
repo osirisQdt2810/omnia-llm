@@ -41,7 +41,7 @@ with:
 |---|---|
 | Base URL | `https://<your-address>/v1` |
 | API key | your token |
-| Text model | `omnia-local` |
+| Text model | `qwen2.5-14b-instruct-awq` |
 | Image model | `sdxl-turbo` |
 
 These are measured timings. After a pause, the first text answer takes about 1.5 minutes while the

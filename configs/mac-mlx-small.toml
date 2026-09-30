@@ -13,7 +13,7 @@ state = "state"
 probe = "apple"
 
 [[models]]
-id = "qwen2.5-1.5b"
+id = "qwen2.5-1.5b-instruct-4bit"
 kind = "text"
 engine = "mlx"
 port = 8732

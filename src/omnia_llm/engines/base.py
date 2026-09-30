@@ -248,9 +248,15 @@ class ProcessEngine(Engine):
         return env
 
     @property
-    def upstream_model(self) -> Optional[str]:
-        """What to put in a request's ``model`` before forwarding (None: leave it)."""
-        return None
+    def upstream_model(self) -> str:
+        """The name the engine serves its model under, given to every request it is sent.
+
+        The model's id, which is vLLM's ``--served-model-name`` and llama.cpp's ``--alias``.
+        Always rewritten, because the manager hands an unknown id to the first model of its
+        kind: a client still using an old id then reaches the engine under a name it knows,
+        instead of getting its 404.
+        """
+        return self.spec.id
 
     def titled(self, title: str, module: str, *args: str) -> list[str]:
         """Run ``module``'s ``main()`` under a neutral process title (see workers/titled.py)."""
@@ -388,7 +394,8 @@ class ProcessEngine(Engine):
 
     # --- traffic -----------------------------------------------------------------------------
     def rewrite(self, body: bytes) -> bytes:
-        """Set the request's ``model`` to :attr:`upstream_model`, when the backend needs it."""
+        """Set the request's ``model`` to :attr:`upstream_model`; anything but a JSON object is
+        forwarded untouched."""
         target = self.upstream_model
         if not target or not body:
             return body

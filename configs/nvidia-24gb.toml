@@ -15,7 +15,7 @@ state = "state"             # tokens, legacy key, logs, weights (gitignored)
 probe = "nvidia"
 
 [[models]]
-id = "omnia-local"          # what clients send as `model`
+id = "qwen2.5-14b-instruct-awq"   # what clients send as `model`: the model's own name
 kind = "text"
 engine = "vllm"
 port = 8722

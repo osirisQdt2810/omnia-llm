@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Optional
 
 from omnia_llm.devices import Device
 from omnia_llm.engines.base import ProcessEngine
@@ -24,7 +23,7 @@ class MlxEngine(ProcessEngine):
     backends = ("apple",)
 
     @property
-    def upstream_model(self) -> Optional[str]:
+    def upstream_model(self) -> str:
         # mlx_lm.server treats an unknown `model` as a model to LOAD — so every request is
         # pointed at the one it already serves, whatever id the client used.
         return self.options.model
