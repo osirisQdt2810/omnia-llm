@@ -1,8 +1,11 @@
-"""Fakes shared by the tests: devices with no hardware behind them, and a model-spec builder."""
+"""Fakes shared by the tests: devices with no hardware behind them, engines with no processes
+behind them, and a model-spec builder."""
 
 from __future__ import annotations
 
+import asyncio
 import socket
+import time
 
 from omnia_llm.config import ModelSpec
 from omnia_llm.devices import Device, DeviceProbe
@@ -49,3 +52,50 @@ def spec(id="omnia-local", kind="text", engine="vllm", port=8722, required_mib=0
     options.setdefault("model", "test/model")
     return ModelSpec(id=id, kind=kind, engine=engine, port=port, required_mib=required_mib,
                      options=options)
+
+
+class FakeGroup:
+    """Stands in for a model's processes: alive until something ends them."""
+
+    def __init__(self):
+        self.code = None
+
+    def poll(self):
+        return self.code
+
+
+def fake_lifecycle(engine, *, ready=True, on_launch=None):
+    """Give ``engine`` fake processes; returns the ids of the devices it is launched on.
+
+    ``on_launch(device)`` runs at each launch: a fake probe can then show the device as taken.
+    """
+    launched = []
+
+    def launch(device):
+        launched.append(device.id)
+        if on_launch is not None:
+            on_launch(device)
+        engine._group = FakeGroup()
+        engine._device = device
+        engine._started_at = engine._last_used = time.monotonic()
+        return engine._group
+
+    async def wait_ready(group):
+        if not ready:
+            raise RuntimeError("exited with code 1 during startup")
+
+    async def stop(reason):
+        if engine._group is not None:
+            engine._group.code = 0
+        engine._group = engine._device = None
+
+    engine._launch, engine._wait_until_ready, engine.stop = launch, wait_ready, stop
+    return launched
+
+
+async def until(condition, timeout=10.0):
+    """Wait for ``condition()`` to hold, failing the test after ``timeout`` seconds."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "timed out waiting"
+        await asyncio.sleep(0.01)

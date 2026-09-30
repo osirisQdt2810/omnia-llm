@@ -1,15 +1,17 @@
 import json
+import time
 
 import httpx
 
 from omnia_llm.config import AppConfig, DevicesConfig, ModelSpec, PathsConfig, ServerConfig
 from omnia_llm.server.manager import ModelManager
-from tests.helpers import fake_probe, gpu
+from tests.helpers import fake_lifecycle, fake_probe, gpu, until
 
 
-def _manager(tmp_path, *models):
-    cfg = AppConfig(ServerConfig(), PathsConfig(state=tmp_path), DevicesConfig(), tuple(models))
-    return ModelManager(cfg, fake_probe([gpu(7)]))
+def _manager(tmp_path, *models, probe=None, server=None):
+    cfg = AppConfig(server or ServerConfig(), PathsConfig(state=tmp_path), DevicesConfig(),
+                    tuple(models))
+    return ModelManager(cfg, probe or fake_probe([gpu(7)]))
 
 
 TEXT = ModelSpec("omnia-local", "text", "vllm", 8722, options={"model": "t"})
@@ -66,3 +68,38 @@ async def test_a_client_still_using_an_old_id_is_answered(tmp_path):
     body = json.dumps({"model": "omnia-local", "messages": []}).encode()
     response = await m.forward(engine, "POST", "/v1/chat/completions", body, {})
     assert response.status_code == 200
+
+
+async def test_a_second_model_starts_on_the_card_the_first_is_using(tmp_path):
+    """The pair shares one card: the one in use, which no longer looks free, before an idle
+    second card, which would take two cards from the pool for one pair of models."""
+    probe = fake_probe([gpu(2), gpu(7)])
+    m = _manager(tmp_path, TEXT, IMAGE, probe=probe)
+
+    def taken(device):  # as on a real card, the model's own memory and context mark it busy
+        probe.devices = [gpu(d.index, used=13800, busy=True) if d.id == device.id else d
+                         for d in probe.devices]
+
+    for engine in m.engines.values():
+        fake_lifecycle(engine, on_launch=taken)
+        engine._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: httpx.Response(200)))
+    text, image = m.engines["omnia-local"], m.engines["sdxl-turbo"]
+    await m.forward(text, "POST", "/v1/chat/completions", b"{}", {})
+    await m.forward(image, "POST", "/v1/images/generations", b"{}", {})
+    assert text.device.id == image.device.id == "nvidia:7"
+
+
+async def test_the_reaper_stops_a_model_left_idle(tmp_path):
+    """The promise to everyone else on the machine: an idle model hands its card back."""
+    m = _manager(tmp_path, TEXT,
+                 server=ServerConfig(idle_timeout_minutes=1, reaper_interval_seconds=0.01))
+    engine = m.engines["omnia-local"]
+    fake_lifecycle(engine)
+    await engine.ensure_running()
+    engine._last_used = time.monotonic() - 120
+    m.start_reaper()
+    try:
+        await until(lambda: not engine.running, timeout=5)
+    finally:
+        await m.shutdown()

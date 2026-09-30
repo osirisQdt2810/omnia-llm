@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 
 import pytest
@@ -32,6 +33,19 @@ def test_revoking_takes_effect_without_a_restart(tmp_path):
     token = TokenStore(path).issue("a")
     assert gateway.verify(token) == "a"
     assert TokenStore(path).revoke("a")  # the script, a separate process
+    assert gateway.verify(token) is None
+
+
+def test_a_revocation_is_seen_even_within_one_timestamp_tick(tmp_path):
+    """Two writes can land inside one mtime tick. The inode and size tell them apart, or the
+    revoked token would go on working."""
+    path = tmp_path / "tokens.json"
+    gateway = TokenStore(path)
+    token = TokenStore(path).issue("a")
+    assert gateway.verify(token) == "a"
+    tick = path.stat().st_mtime_ns
+    assert TokenStore(path).revoke("a")
+    os.utime(path, ns=(tick, tick))  # the rewrite, landed in the same tick
     assert gateway.verify(token) is None
 
 

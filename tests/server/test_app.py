@@ -282,6 +282,16 @@ def test_requests_without_a_token_never_clear_a_guessers_count(client):
     assert c.get("/status", headers=wrong).status_code == 429
 
 
+def test_health_never_clears_a_guessers_count(client):
+    """Open, so no success either: interleaved with the guesses, it must not reset them."""
+    c, _ = client
+    wrong = {"Authorization": "Bearer wrong"}
+    for _ in range(MAX_FAILURES):
+        c.get("/status", headers=wrong)
+        c.get("/health")
+    assert c.get("/status", headers=wrong).status_code == 429
+
+
 def test_health_counts_for_nothing_in_the_lockout(client):
     """Open, so neither a failure nor a success, whatever token it carries."""
     c, token = client

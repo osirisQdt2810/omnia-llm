@@ -18,42 +18,13 @@ import pytest
 import omnia_llm.platforms  # noqa: F401 - registration
 from omnia_llm.config import ConfigError
 from omnia_llm.engines import ENGINES, EngineBusy
-from tests.helpers import fake_probe, free_port, gpu, spec
-
-
-class _FakeGroup:
-    """Stands in for the model's processes: alive until something ends them."""
-
-    def __init__(self):
-        self.code = None
-
-    def poll(self):
-        return self.code
+from tests.helpers import fake_lifecycle, fake_probe, free_port, gpu, spec, until
 
 
 def _engine(paths, *, probe=None, ready=True, **spec_kw):
     s = spec(**spec_kw)
     engine = ENGINES.get(s.engine)(s, probe or fake_probe([gpu(7)]), paths)
-    launched = []
-
-    def launch(device):
-        launched.append(device.id)
-        engine._group = _FakeGroup()
-        engine._device = device
-        engine._started_at = engine._last_used = time.monotonic()
-        return engine._group
-
-    async def wait_ready(group):
-        if not ready:
-            raise RuntimeError("exited with code 1 during startup")
-
-    async def stop(reason):
-        if engine._group is not None:
-            engine._group.code = 0
-        engine._group = engine._device = None
-
-    engine._launch, engine._wait_until_ready, engine.stop = launch, wait_ready, stop
-    return engine, launched
+    return engine, fake_lifecycle(engine, ready=ready)
 
 
 class TestItStartsOnlyWhenAsked:
@@ -196,13 +167,6 @@ def _alive(group: int) -> bool:
     return True
 
 
-async def _until(condition, timeout=10.0):
-    deadline = time.monotonic() + timeout
-    while not condition():
-        assert time.monotonic() < deadline, "timed out waiting"
-        await asyncio.sleep(0.01)
-
-
 class _HungUpTerminal:
     """stdout after the terminal closed: every write is an I/O error."""
 
@@ -249,7 +213,7 @@ class TestItsProcesses:
         is gone and give up, not poll a dead port for the whole startup timeout."""
         engine = real(SLEEPER)
         start = asyncio.create_task(engine.ensure_running())
-        await _until(lambda: engine._group is not None)
+        await until(lambda: engine._group is not None)
         await engine.stop("asked to stop")
         with pytest.raises(RuntimeError, match="stopped while starting"):
             await asyncio.wait_for(start, timeout=5)
@@ -263,7 +227,7 @@ class TestItsProcesses:
         leader.wait(timeout=10)
         assert _alive(leader.pid), "the child should outlive its leader"
         await engine.stop("idle")
-        await _until(lambda: not _alive(leader.pid))
+        await until(lambda: not _alive(leader.pid))
 
     async def test_what_a_crashed_model_left_behind_is_killed_when_the_crash_is_found(self, real):
         """The instant its leader is reaped is the last at which the group's id is surely its
@@ -271,8 +235,8 @@ class TestItsProcesses:
         later stop."""
         engine = real(LEAVES_A_CHILD)
         group = engine._launch(gpu(7)).leader.pid
-        await _until(lambda: not engine.running)  # as /status or the reaper would find it
-        await _until(lambda: not _alive(group))
+        await until(lambda: not engine.running)  # as /status or the reaper would find it
+        await until(lambda: not _alive(group))
 
     async def test_a_crashed_model_is_never_signalled_once_it_is_reaped(self, real):
         """Reaping the leader frees its pid, and the kernel may give it to any new process group
@@ -280,7 +244,7 @@ class TestItsProcesses:
         be somebody else's: here, a stand-in given the same id."""
         engine = real(CRASHES)
         engine._launch(gpu(7))
-        await _until(lambda: not engine.running)
+        await until(lambda: not engine.running)
         victim = subprocess.Popen(SLEEPER, start_new_session=True)
         try:
             engine._group.leader.pid = victim.pid
@@ -296,7 +260,7 @@ class TestItsProcesses:
         engine = real(IGNORES_SIGTERM)
         engine.shutdown_grace_seconds = 0.3
         group = engine._launch(gpu(7)).leader.pid
-        await _until(lambda: "ready" in (paths.logs / "omnia-local.log").read_text())
+        await until(lambda: "ready" in (paths.logs / "omnia-local.log").read_text())
         await engine.stop("idle")
         assert not _alive(group)
 
@@ -308,7 +272,7 @@ class TestItsProcesses:
         group = engine._launch(gpu(7)).leader.pid
         monkeypatch.setattr(sys, "stdout", _HungUpTerminal())
         await engine.stop("gateway shutting down")
-        await _until(lambda: not _alive(group))
+        await until(lambda: not _alive(group))
 
     async def test_a_request_during_a_stop_waits_for_the_old_engine_to_go(self, real):
         """A /stop does not take the lock. Let through at once, the next request found the old
