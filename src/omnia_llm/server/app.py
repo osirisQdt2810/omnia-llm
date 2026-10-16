@@ -24,6 +24,7 @@ from omnia_llm.engines import Engine, EngineBusy
 from omnia_llm.server import auth
 from omnia_llm.server.lockout import Lockout
 from omnia_llm.server.manager import ModelManager
+from omnia_llm.server.settings import RuntimeSettings
 from omnia_llm.server.tokens import TokenStore
 
 #: The only paths answered without a token. Matched exactly: "/health/" is not one of them.
@@ -54,7 +55,8 @@ def _client(request: Request) -> str:
 
 def create_app(config: AppConfig, probe: Optional[DeviceProbe] = None) -> FastAPI:
     probe = probe or detect(config.devices.probe)
-    manager = ModelManager(config, probe)
+    settings = RuntimeSettings.from_config(config)
+    manager = ModelManager(config, probe, settings)
     tokens = TokenStore(config.paths.tokens_file)
     legacy = auth.read_legacy_key(config.paths.legacy_key_file)
     if legacy:
@@ -109,12 +111,36 @@ def create_app(config: AppConfig, probe: Optional[DeviceProbe] = None) -> FastAP
 
     @app.get("/status")
     async def status() -> JSONResponse:
+        """Every model's state, the devices, and the idle timeout in force."""
         try:
             devices = [d.to_dict() for d in probe.list_devices()]
         except DeviceError as exc:
             devices = [{"error": str(exc)}]
         return JSONResponse({"models": manager.status(), "devices": devices,
+                             "idle_timeout_minutes": settings.idle_timeout_minutes,
                              "time": time.strftime("%F %T")})
+
+    @app.get("/settings")
+    async def get_settings() -> JSONResponse:
+        """The idle timeout in force, and the config file's value it defaults to."""
+        return JSONResponse(settings.to_dict())
+
+    @app.put("/settings")
+    async def put_settings(request: Request) -> JSONResponse:
+        """Set ``{"idle_timeout_minutes": N}``, 1 <= N <= 1440, fractions allowed.
+
+        Takes effect on the reaper's next tick, no restart, and is kept in
+        ``state/settings.json`` across one. Anything else in the body is a 400 naming the range.
+        """
+        try:
+            body = await request.json()
+        except ValueError:
+            body = None
+        try:
+            settings.update(body)
+        except ValueError as exc:
+            return _error(400, str(exc), "bad_request")
+        return JSONResponse(settings.to_dict())
 
     @app.post("/warm")
     async def warm(request: Request) -> JSONResponse:
@@ -128,7 +154,8 @@ def create_app(config: AppConfig, probe: Optional[DeviceProbe] = None) -> FastAP
 
     @app.post("/stop")
     async def stop() -> JSONResponse:
-        """Hand every device back now, without waiting out the idle timer."""
+        """Hand every device back now, without waiting out the idle timer. The idle timeout
+        itself is unchanged: the next request starts its model again."""
         await manager.stop_all("asked to stop")
         return JSONResponse({"stopped": True})
 

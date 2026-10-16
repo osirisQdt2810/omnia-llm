@@ -37,4 +37,7 @@ restart omnia-llm. A newly named model is downloaded on its first request, into 
 Two other settings are worth knowing:
 
 - `[server] idle_timeout_minutes`: how long a model may sit unused before it stops (default 30).
+  This file setting is only the default: the idle time can also be changed, between 1 minute and
+  one day, from the endpoint card in Omnia, without a restart, and that choice is kept until it
+  is changed again.
 - `[devices] probe`: which hardware to use: `auto`, `nvidia`, `rocm`, `apple` or `cpu`.

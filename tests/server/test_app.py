@@ -334,3 +334,56 @@ def test_warm_refuses_kinds_of_the_wrong_shape(client, kinds):
     assert r.status_code == 400
     assert r.json()["error"]["type"] == "bad_request"
 
+
+
+def _settings_gateway(tmp_path, minutes=30, client="tester"):
+    cfg = AppConfig(ServerConfig(idle_timeout_minutes=minutes),
+                    PathsConfig(state=tmp_path / "state"), DevicesConfig(), (TEXT,))
+    app = create_app(cfg, fake_probe([gpu(7)]))
+    token = app.state.tokens.issue(client)
+    return TestClient(app), {"Authorization": f"Bearer {token}"}
+
+
+def test_the_idle_timeout_defaults_to_the_config_value(tmp_path):
+    c, auth_header = _settings_gateway(tmp_path, minutes=45)
+    r = c.get("/settings", headers=auth_header)
+    assert r.status_code == 200
+    assert r.json() == {"idle_timeout_minutes": 45, "default_idle_timeout_minutes": 45}
+    assert c.get("/status", headers=auth_header).json()["idle_timeout_minutes"] == 45
+
+
+def test_a_changed_idle_timeout_is_kept_across_a_restart(tmp_path):
+    c, auth_header = _settings_gateway(tmp_path)
+    r = c.put("/settings", json={"idle_timeout_minutes": 5.5}, headers=auth_header)
+    assert r.status_code == 200
+    assert r.json() == {"idle_timeout_minutes": 5.5, "default_idle_timeout_minutes": 30}
+    assert c.get("/status", headers=auth_header).json()["idle_timeout_minutes"] == 5.5
+
+    restarted, auth_header = _settings_gateway(tmp_path, client="after-restart")
+    assert restarted.get("/settings", headers=auth_header).json()["idle_timeout_minutes"] == 5.5
+
+
+@pytest.mark.parametrize("body", [{"idle_timeout_minutes": 0}, {"idle_timeout_minutes": 1441},
+                                  {"idle_timeout_minutes": True}, {"idle_timeout_minutes": "10"},
+                                  {}, {"idle_timeout_minutes": 10, "other": 1}])
+def test_a_bad_idle_timeout_is_a_400_that_names_the_range(tmp_path, body):
+    c, auth_header = _settings_gateway(tmp_path)
+    r = c.put("/settings", json=body, headers=auth_header)
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "bad_request"
+    assert "between 1 and 1440" in r.json()["error"]["message"]
+    assert c.get("/settings", headers=auth_header).json()["idle_timeout_minutes"] == 30
+
+
+def test_a_body_that_is_not_json_is_a_400(tmp_path):
+    c, auth_header = _settings_gateway(tmp_path)
+    r = c.put("/settings", content=b"ten", headers=auth_header)
+    assert r.status_code == 400 and r.json()["error"]["type"] == "bad_request"
+
+
+@pytest.mark.parametrize("method", ["GET", "PUT"])
+def test_the_settings_need_a_token(tmp_path, method):
+    c, _ = _settings_gateway(tmp_path)
+    r = c.request(method, "/settings", json={"idle_timeout_minutes": 5})
+    assert r.status_code == 401
+    assert not (tmp_path / "state" / "settings.json").exists()

@@ -118,6 +118,24 @@ async def test_the_reaper_stops_a_model_left_idle(tmp_path):
         await m.shutdown()
 
 
+async def test_the_reaper_uses_an_idle_timeout_changed_while_it_runs(tmp_path):
+    """A client may shorten the timeout at any time; the running reaper must act on it."""
+    m = _manager(tmp_path, TEXT,
+                 server=ServerConfig(idle_timeout_minutes=30, reaper_interval_seconds=0.01))
+    engine = m.engines["omnia-local"]
+    fake_lifecycle(engine)
+    await engine.ensure_running()
+    engine._last_used = time.monotonic() - 120  # idle past one minute, not past thirty
+    m.start_reaper()
+    try:
+        await asyncio.sleep(0.1)  # several ticks at the old timeout
+        assert engine.running
+        m.settings.update({"idle_timeout_minutes": 1})
+        await until(lambda: not engine.running, timeout=5)
+    finally:
+        await m.shutdown()
+
+
 async def test_a_shutdown_during_the_reapers_stop_still_ends_the_model(tmp_path):
     """The shutdown cancels the reaper. Cancelled mid-stop, the stop used to take the group with
     it, and a model that ignores SIGTERM outlived the gateway, holding its memory and port."""
