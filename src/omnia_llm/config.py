@@ -32,7 +32,8 @@ class ConfigError(ValueError):
 class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 8721
-    #: Minutes with no request before a model is stopped and its device handed back.
+    #: Minutes with no request before a model is stopped and its device handed back. The
+    #: default only: a client may override it at runtime (``PUT /settings``).
     idle_timeout_minutes: float = 30.0
     reaper_interval_seconds: float = 20.0
 
@@ -52,6 +53,10 @@ class PathsConfig:
     @property
     def tokens_file(self) -> Path:
         return self.state / "tokens.json"
+
+    @property
+    def settings_file(self) -> Path:
+        return self.state / "settings.json"
 
     @property
     def legacy_key_file(self) -> Path:

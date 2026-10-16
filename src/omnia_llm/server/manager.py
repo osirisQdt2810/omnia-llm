@@ -9,16 +9,19 @@ from typing import Iterable, Optional
 from omnia_llm.config import AppConfig
 from omnia_llm.devices import DeviceProbe
 from omnia_llm.engines import ENGINES, Engine
+from omnia_llm.server.settings import RuntimeSettings
 
 
 class ModelManager:
     """One engine per configured model, and the rules for which one answers a request."""
 
-    def __init__(self, config: AppConfig, probe: DeviceProbe) -> None:
+    def __init__(self, config: AppConfig, probe: DeviceProbe,
+                 settings: Optional[RuntimeSettings] = None) -> None:
         import omnia_llm.platforms  # noqa: F401 - registers the platform-only engines
 
         self.config = config
         self.probe = probe
+        self.settings = settings or RuntimeSettings.from_config(config)
         self.engines: dict[str, Engine] = {
             spec.id: ENGINES.get(spec.engine)(spec, probe, config.paths) for spec in config.models
         }
@@ -88,9 +91,10 @@ class ModelManager:
         self._reaper = asyncio.create_task(self._reap_forever())
 
     async def _reap_forever(self) -> None:
-        timeout = self.config.server.idle_timeout_seconds
         while True:
             await asyncio.sleep(self.config.server.reaper_interval_seconds)
+            # Read on every tick: a client may change the timeout while the gateway runs.
+            timeout = self.settings.idle_timeout_seconds
             for engine in self.engines.values():
                 stop_if_idle = getattr(engine, "stop_if_idle", None)
                 if stop_if_idle is not None:
