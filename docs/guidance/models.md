@@ -31,7 +31,9 @@ such as `qwen2.5-14b-instruct-awq`.
 - **Gemma 4 instead of Qwen, on the same 24 GB NVIDIA card.** `configs/nvidia-24gb-gemma4.toml`
   serves Gemma 4 26B-A4B (text) next to the image model. It gives better Vietnamese and fewer
   stray characters than the 14B Qwen, and starts in about 12 seconds. It runs on llama.cpp, so
-  first build `llama-server` with CUDA into `bin/` (this takes a few minutes):
+  first build `llama-server` with CUDA into `bin/` (this takes a few minutes). The build needs the
+  CUDA toolkit (`nvcc`, not only the driver) and the OpenSSL development headers: with libcurl
+  switched off, llama.cpp downloads models through its own built-in HTTPS client.
 
   ```
   git clone --depth 1 https://github.com/ggml-org/llama.cpp.git bin/llama.cpp

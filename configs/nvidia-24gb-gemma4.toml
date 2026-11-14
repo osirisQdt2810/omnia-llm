@@ -8,6 +8,7 @@
 # ~33 tokens/s with 8 layers' experts in RAM, ~19 tokens/s with 16 — a few seconds per note field.
 #
 # Needs llama.cpp's `llama-server` built with CUDA at bin/llama-server (see docs/guidance/models.md).
+# `--n-cpu-moe` and `-fa on` are recent llama.cpp spellings (2026): build from a current checkout.
 
 [server]
 host = "127.0.0.1"          # loopback only; reach it through ngrok (deploy/) or an SSH tunnel
