@@ -28,6 +28,22 @@ such as `qwen2.5-14b-instruct-awq`.
   under the old name still reach the text model.
 - **A second text model.** Add another `[[models]]` block with its own `id` and `port`. Omnia then
   lists both.
+- **Gemma 4 instead of Qwen, on the same 24 GB NVIDIA card.** `configs/nvidia-24gb-gemma4.toml`
+  serves Gemma 4 26B-A4B (text) next to the image model. It gives better Vietnamese and fewer
+  stray characters than the 14B Qwen, and starts in about 12 seconds. It runs on llama.cpp, so
+  first build `llama-server` with CUDA into `bin/` (this takes a few minutes):
+
+  ```
+  git clone --depth 1 https://github.com/ggml-org/llama.cpp.git bin/llama.cpp
+  cmake -S bin/llama.cpp -B bin/llama.cpp/build -DGGML_CUDA=ON -DLLAMA_CURL=OFF -DBUILD_SHARED_LIBS=OFF
+  cmake --build bin/llama.cpp/build --target llama-server -j
+  ln -s llama.cpp/build/bin/llama-server bin/llama-server
+  ```
+
+  Then name the config in `deploy/omnia-llm.env`, restart omnia-llm, and pick
+  `gemma-4-26b-a4b-it` as the text model in Omnia. The model (about 17 GB) is downloaded on its
+  first request. Part of it is kept in the machine's memory rather than on the card, which is
+  what leaves room for the image model; it needs about 10 GB of free system memory.
 
 ## After a change
 
