@@ -1,0 +1,56 @@
+# One shared 24 GB NVIDIA card: Gemma 4 26B-A4B (text, llama.cpp) and an image model, together.
+# Serve with:  scripts/run.sh configs/nvidia-24gb-gemma4.toml
+#
+# Gemma 4 is a mixture-of-experts model: about 4B of its 26B parameters work on each token. Its
+# 4-bit build alone takes ~18.6 GB of the card, which leaves no room for the image model. Moving
+# the experts of the first 8 layers to system RAM (--n-cpu-moe 8) brings it to ~15.2 GB, so both
+# models share one card. Measured on an RTX A5000: ~89 tokens/s with every expert on the card,
+# ~33 tokens/s with 8 layers' experts in RAM, ~19 tokens/s with 16 — a few seconds per note field.
+#
+# Needs llama.cpp's `llama-server` built with CUDA at bin/llama-server (see docs/guidance/models.md).
+# `--n-cpu-moe` and `-fa on` are recent llama.cpp spellings (2026): build from a current checkout.
+
+[server]
+host = "127.0.0.1"          # loopback only; reach it through ngrok (deploy/) or an SSH tunnel
+port = 8721
+# Minutes with no request before a model is stopped and its card handed back.
+idle_timeout_minutes = 30
+
+[paths]
+state = "state"             # tokens, legacy key, logs, weights (gitignored)
+
+[devices]
+probe = "nvidia"
+
+[[models]]
+id = "gemma-4-26b-a4b-it"   # what clients send as `model`: the model's own name
+kind = "text"
+engine = "llamacpp"
+port = 8722
+required_mib = 16000
+[models.options]
+# Downloaded on first use into .model-cache/ (llama.cpp's own cache), ~17 GB.
+hf_repo = "unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_M"
+binary = "bin/llama-server"
+ctx_size = 8192             # shared by the 2 parallel slots: a word in, a sentence out
+gpu_layers = 999
+extra_args = [
+  "--n-cpu-moe", "8",       # the first 8 layers' experts in system RAM: room for the image model
+  "-np", "2",
+  "-fa", "on",
+  "--jinja",
+  # Gemma 4 "thinks" before answering by default: ~10x the tokens for a short note field.
+  "--reasoning-budget", "0",
+]
+
+[[models]]
+id = "sdxl-turbo"
+kind = "image"
+engine = "diffusers"
+port = 8723
+required_mib = 5000
+[models.options]
+# Distilled to 4 steps, ~7 GB in fp16; with CPU offload only the active part sits on the card.
+model = "stabilityai/sdxl-turbo"
+steps = 4
+cpu_offload = true
