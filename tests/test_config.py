@@ -83,6 +83,7 @@ def test_an_id_made_of_file_name_characters_is_accepted(good):
     {"port": 0}, {"port": 65536}, {"port": "8721"}, {"port": True},
     {"idle_timeout_minutes": 0}, {"idle_timeout_minutes": -5}, {"idle_timeout_minutes": "30"},
     {"reaper_interval_seconds": 0}, {"reaper_interval_seconds": False},
+    {"cpu_busy_load": 0}, {"cpu_busy_load": "0.7"}, {"cpu_busy_load": True},
 ])
 def test_a_server_setting_out_of_range_is_refused(server):
     with pytest.raises(ConfigError, match=next(iter(server))):
@@ -109,6 +110,62 @@ def test_a_model_may_need_no_memory_at_all():
 def test_fractional_minutes_are_fine():
     cfg = AppConfig.from_dict(_cfg(server={"port": 8721, "idle_timeout_minutes": 0.5}))
     assert cfg.server.idle_timeout_seconds == 30.0
+
+
+def test_a_config_without_the_cpu_and_single_device_keys_keeps_todays_behaviour():
+    cfg = AppConfig.from_dict(_cfg())
+    assert cfg.devices.single_device is False and cfg.server.cpu_busy_load == 0.7
+    model = cfg.models[0]
+    assert model.when_cpu_busy is None and model.profile(cpu_busy=True) is model
+
+
+@pytest.mark.parametrize("value", ["yes", 1, 0])
+def test_single_device_is_true_or_false(value):
+    with pytest.raises(ConfigError, match="single_device must be true or false"):
+        AppConfig.from_dict(_cfg(devices={"single_device": value}))
+
+
+def test_single_device_can_be_turned_on():
+    assert AppConfig.from_dict(_cfg(devices={"single_device": True})).devices.single_device
+
+
+def _busy(**override):
+    return _model(required_mib=15500,
+                  options={"model": "x", "extra_args": ["--n-cpu-moe", "8", "-np", "2"],
+                           "max_model_len": 8192},
+                  when_cpu_busy=override)
+
+
+def test_the_busy_cpu_settings_are_laid_over_the_models_own():
+    """Shallowly: a list it names replaces the model's whole, an option it does not name stays."""
+    model = AppConfig.from_dict(_cfg(models=[
+        _busy(required_mib=19000, options={"extra_args": ["-np", "2"]})])).models[0]
+    busy = model.profile(cpu_busy=True)
+    assert (busy.required_mib, busy.options) == (
+        19000, {"model": "x", "extra_args": ["-np", "2"], "max_model_len": 8192})
+    assert model.profile(cpu_busy=False) is model
+    assert model.options["extra_args"] == ["--n-cpu-moe", "8", "-np", "2"]
+
+
+def test_busy_cpu_settings_without_required_mib_keep_the_models_own():
+    model = AppConfig.from_dict(_cfg(models=[_busy(options={"max_model_len": 4096})])).models[0]
+    assert model.profile(cpu_busy=True).required_mib == 15500
+
+
+@pytest.mark.parametrize("override, message", [
+    ({"required_mib": 19000, "extra_args": []}, "unknown key"),
+    ({"required_mib": "19000"}, "required_mib"),
+    ({"required_mib": -1}, "required_mib"),
+    ({"options": ["-np", "2"]}, "options must be a table"),
+])
+def test_busy_cpu_settings_that_cannot_run_are_refused(override, message):
+    with pytest.raises(ConfigError, match=f"when_cpu_busy.*{message}"):
+        AppConfig.from_dict(_cfg(models=[_busy(**override)]))
+
+
+def test_busy_cpu_settings_must_be_a_table():
+    with pytest.raises(ConfigError, match="when_cpu_busy: must be a table"):
+        AppConfig.from_dict(_cfg(models=[_model(when_cpu_busy=19000)]))
 
 
 def test_models_of_a_kind():

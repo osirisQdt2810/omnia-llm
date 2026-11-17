@@ -67,7 +67,7 @@ async def test_a_client_still_using_an_old_id_is_answered(tmp_path):
     m = _manager(tmp_path, ModelSpec(served, "text", "vllm", 8722, options={"model": "t"}))
     engine = m.route("text", "omnia-local")
 
-    async def running(prefer=()):
+    async def running(prefer=(), **start):
         pass
 
     def vllm(request):
@@ -192,7 +192,7 @@ async def test_a_shutdown_cancels_a_warm_up_still_starting(tmp_path):
     m = _manager(tmp_path, TEXT)
     started = asyncio.Event()
 
-    async def slow_start(prefer=()):
+    async def slow_start(prefer=(), **start):
         started.set()
         await asyncio.Event().wait()  # never finishes on its own
 

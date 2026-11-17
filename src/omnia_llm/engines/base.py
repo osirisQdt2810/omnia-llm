@@ -29,7 +29,7 @@ from typing import Any, ClassVar, Iterable, Optional
 import httpx
 
 from omnia_llm.config import ConfigError, ModelSpec, PathsConfig
-from omnia_llm.devices import Device, DeviceProbe
+from omnia_llm.devices import CpuLoad, Device, DeviceProbe
 
 
 class EngineBusy(RuntimeError):
@@ -169,6 +169,7 @@ class Engine(abc.ABC):
         self.spec = spec
         self.probe = probe
         self.paths = paths
+        #: The options of the run it is in: a start on a busy CPU takes ``when_cpu_busy``'s.
         self.options = self.check_options(spec)
 
     @classmethod
@@ -187,9 +188,17 @@ class Engine(abc.ABC):
         """``spec``'s options as this engine's ``Options``, or ConfigError naming the mistake.
 
         Public so that ``omnia-llm models`` checks a config exactly as ``serve`` will: a mistake
-        that passes the one and fails the other is a service in a restart loop.
+        that passes the one and fails the other is a service in a restart loop. The
+        ``when_cpu_busy`` options are checked too, now rather than at the first start on a busy
+        CPU, hours later.
         """
         where = f"model {spec.id!r} ({spec.engine})"
+        if spec.when_cpu_busy is not None:
+            cls._options(spec.profile(cpu_busy=True), f"{where} when_cpu_busy")
+        return cls._options(spec, where)
+
+    @classmethod
+    def _options(cls, spec: ModelSpec, where: str) -> Any:
         hints = typing.get_type_hints(cls.Options)
         known = {f.name: hints[f.name] for f in dataclasses.fields(cls.Options)}
         unknown = set(spec.options) - set(known)
@@ -221,9 +230,20 @@ class Engine(abc.ABC):
     @abc.abstractmethod
     def device(self) -> Optional[Device]: ...
 
+    @property
+    def required_mib(self) -> int:
+        """Device memory the model declared for the run it is in: its spec's, or its
+        ``when_cpu_busy`` profile's when it started with that."""
+        return self.spec.required_mib
+
     @abc.abstractmethod
-    async def ensure_running(self, prefer: Iterable[str] = ()) -> None:
+    async def ensure_running(self, prefer: Iterable[str] = (), *, single_device: bool = False,
+                             cpu: Optional[CpuLoad] = None) -> None:
         """Start the model if it is not up; ``prefer`` = device ids other models already hold.
+
+        With ``single_device``, only a device in ``prefer`` will do, when it names one. ``cpu``
+        is the host's load as the start was decided: busy, the model starts with its
+        ``when_cpu_busy`` profile.
 
         Raises:
             EngineBusy: when no device has room.
@@ -231,7 +251,8 @@ class Engine(abc.ABC):
 
     @abc.abstractmethod
     async def forward(self, method: str, path: str, body: bytes, headers: dict,
-                      prefer: Iterable[str] = ()) -> httpx.Response: ...
+                      prefer: Iterable[str] = (), *, single_device: bool = False,
+                      cpu: Optional[CpuLoad] = None) -> httpx.Response: ...
 
     @abc.abstractmethod
     async def stop(self, reason: str) -> None: ...
@@ -263,6 +284,8 @@ class ProcessEngine(Engine):
         self.python = python
         self._group: Optional[_ProcessGroup] = None
         self._device: Optional[Device] = None
+        #: The model as its last start ran it: the spec, or with ``when_cpu_busy`` laid over it.
+        self._profile = spec
         self._lock = asyncio.Lock()
         #: The task ending the last run, while it does: a /stop and the shutdown do not take the
         #: lock, and whoever started it may be cancelled before it is done.
@@ -313,6 +336,15 @@ class ProcessEngine(Engine):
     def device(self) -> Optional[Device]:
         return self._device if self.running else None
 
+    @property
+    def required_mib(self) -> int:
+        return self._profile.required_mib
+
+    @property
+    def profile(self) -> str:
+        """The settings the last start ran with: ``when_cpu_busy`` or ``default``."""
+        return "default" if self._profile is self.spec else "when_cpu_busy"
+
     def idle_seconds(self) -> float:
         return time.monotonic() - self._last_used if self._last_used else 0.0
 
@@ -323,12 +355,14 @@ class ProcessEngine(Engine):
             "running": self.running,
             "starting": self._starting,
             "device": self._device.id if self.running and self._device else None,
+            "profile": self.profile if self.running else None,
             "idle_seconds": round(self.idle_seconds(), 1),
             "uptime_seconds": round(time.monotonic() - self._started_at, 1) if self.running else 0.0,
         }
 
     # --- lifecycle ---------------------------------------------------------------------------
-    async def ensure_running(self, prefer: Iterable[str] = ()) -> None:
+    async def ensure_running(self, prefer: Iterable[str] = (), *, single_device: bool = False,
+                             cpu: Optional[CpuLoad] = None) -> None:
         """Start the model if it is not up. Safe to call from every request.
 
         Holds the lock across the whole cold start, readiness wait included: a second request
@@ -347,10 +381,17 @@ class ProcessEngine(Engine):
                 # killed when that was found. The stop waits for that to be gone: until then it
                 # holds the port, and memory the device pick below would count as taken.
                 await self.stop("exited")
-            device = self.probe.pick(self.spec.required_mib, prefer)
+            profile = self.spec.profile(cpu_busy=cpu is not None and cpu.busy)
+            prefer = tuple(prefer)
+            device = self.probe.pick(profile.required_mib, prefer, single_device=single_device)
             if device is None:
-                raise EngineBusy(f"no device has {self.spec.required_mib} MiB free right now "
+                where = (f"{prefer[0]}, the device the other models are on, does not have"
+                         if single_device and prefer else "no device has")
+                raise EngineBusy(f"{where} {profile.required_mib} MiB free right now "
                                  f"for {self.id!r} — nothing was started")
+            self._profile, self.options = profile, self.check_options(profile)
+            _say(f"[{self.id}] starting on {device.id} with its {self.profile} settings "
+                 f"({profile.required_mib} MiB): {cpu or 'CPU load unknown'}")
             self._starting = True
             try:
                 await self._wait_until_ready(self._launch(device))
@@ -508,13 +549,14 @@ class ProcessEngine(Engine):
         return json.dumps(payload).encode()
 
     async def forward(self, method: str, path: str, body: bytes, headers: dict,
-                      prefer: Iterable[str] = ()) -> httpx.Response:
-        """Send one request, starting the model first if needed.
+                      prefer: Iterable[str] = (), *, single_device: bool = False,
+                      cpu: Optional[CpuLoad] = None) -> httpx.Response:
+        """Send one request, starting the model first if needed (see :meth:`ensure_running`).
 
         The idle clock is reset on the way in AND out: only in would let the timer fire during a
         long generation; only out would let a stalled request look idle.
         """
-        await self.ensure_running(prefer)
+        await self.ensure_running(prefer, single_device=single_device, cpu=cpu)
         self._last_used = time.monotonic()
         try:
             return await self._client.request(method, f"http://127.0.0.1:{self.spec.port}{path}",

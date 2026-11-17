@@ -1,11 +1,20 @@
-# One shared 24 GB NVIDIA card: Gemma 4 26B-A4B (text, llama.cpp) and an image model, together.
+# One shared 24 GB NVIDIA card: Gemma 4 26B-A4B (text, llama.cpp) and an image model, both on
+# that ONE card, never a second.
 # Serve with:  scripts/run.sh configs/nvidia-24gb-gemma4.toml
 #
 # Gemma 4 is a mixture-of-experts model: about 4B of its 26B parameters work on each token. Its
-# 4-bit build alone takes ~18.6 GB of the card, which leaves no room for the image model. Moving
-# the experts of the first 8 layers to system RAM (--n-cpu-moe 8) brings it to ~15.2 GB, so both
-# models share one card. Measured on an RTX A5000: ~89 tokens/s with every expert on the card,
-# ~33 tokens/s with 8 layers' experts in RAM, ~19 tokens/s with 16 — a few seconds per note field.
+# 4-bit build alone takes ~18.6 GB of the card, which leaves no room for the image model (~7 GB
+# while it draws). Moving the experts of the first 8 layers to system RAM (--n-cpu-moe 8) brings
+# it to ~15.2 GB, so both models fit on the card together. Measured on an RTX A5000: ~50-89
+# tokens/s with every expert on the card; ~33 tokens/s with 8 layers' experts in RAM while the
+# machine's CPUs are idle, but under 1 token/s when other users saturate them, because those
+# experts are computed on the CPU.
+#
+# So the choice is made each time Gemma starts, from the machine's CPU load at that moment:
+#   - CPUs free: the 8 layers' experts go to RAM, and both models serve side by side.
+#   - CPUs busy (load >= cpu_busy_load per CPU): Gemma takes the card whole (when_cpu_busy below),
+#     and the two models take turns: a request for the one not running waits for the other's
+#     requests to finish, stops it, and starts in its place.
 #
 # Needs llama.cpp's `llama-server` built with CUDA at bin/llama-server (see docs/guidance/models.md).
 # `--n-cpu-moe` and `-fa on` are recent llama.cpp spellings (2026): build from a current checkout.
@@ -15,19 +24,23 @@ host = "127.0.0.1"          # loopback only; reach it through ngrok (deploy/) or
 port = 8721
 # Minutes with no request before a model is stopped and its card handed back.
 idle_timeout_minutes = 30
+# The 1-minute load average per CPU from which the CPUs count as busy when a model starts.
+cpu_busy_load = 0.7
 
 [paths]
 state = "state"             # tokens, legacy key, logs, weights (gitignored)
 
 [devices]
 probe = "nvidia"
+# Both models on one card: the second starts beside the first, or waits its turn there.
+single_device = true
 
 [[models]]
 id = "gemma-4-26b-a4b-it"   # what clients send as `model`: the model's own name
 kind = "text"
 engine = "llamacpp"
 port = 8722
-required_mib = 16000
+required_mib = 15500        # ~15.2 GB measured with 8 layers' experts in RAM
 [models.options]
 # Downloaded on first use into .model-cache/ (llama.cpp's own cache), ~17 GB.
 hf_repo = "unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_M"
@@ -42,13 +55,18 @@ extra_args = [
   # Gemma 4 "thinks" before answering by default: ~10x the tokens for a short note field.
   "--reasoning-budget", "0",
 ]
+# When the CPUs are busy as Gemma starts: every expert on the card, so no token waits for a CPU.
+[models.when_cpu_busy]
+required_mib = 19000        # ~18.6 GB measured
+[models.when_cpu_busy.options]
+extra_args = ["-np", "2", "-fa", "on", "--jinja", "--reasoning-budget", "0"]
 
 [[models]]
 id = "sdxl-turbo"
 kind = "image"
 engine = "diffusers"
 port = 8723
-required_mib = 5000
+required_mib = 7000         # ~7 GB on the card while it draws, though less between images
 [models.options]
 # Distilled to 4 steps, ~7 GB in fp16; with CPU offload only the active part sits on the card.
 model = "stabilityai/sdxl-turbo"

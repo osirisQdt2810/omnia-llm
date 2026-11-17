@@ -12,6 +12,7 @@ such as `qwen2.5-14b-instruct-awq`.
 | `port` | A free local port, used by this model only |
 | `required_mib` | GPU memory the model needs, so it only starts where there is room (GPUs only) |
 | `[models.options]` | The engine's own settings. `model` names the model to download |
+| `[models.when_cpu_busy]` | Optional. A different `required_mib`, and different options, for when the machine's CPUs are busy as the model starts (see below) |
 
 | Engine | Runs on | What `model` is | Other options |
 |---|---|---|---|
@@ -44,18 +45,38 @@ such as `qwen2.5-14b-instruct-awq`.
 
   Then name the config in `deploy/omnia-llm.env`, restart omnia-llm, and pick
   `gemma-4-26b-a4b-it` as the text model in Omnia. The model (about 17 GB) is downloaded on its
-  first request. Part of it is kept in the machine's memory rather than on the card, which is
-  what leaves room for the image model; it needs about 10 GB of free system memory.
+  first request. Both models always stay on one card. When the machine's CPUs are idle as Gemma
+  starts, part of it is kept in the machine's memory rather than on the card, which leaves room
+  for the image model beside it; that needs about 10 GB of free system memory. When other people
+  keep the CPUs busy, that part would slow Gemma to a crawl, so it takes the whole card instead,
+  and the two models take turns on it: switching between text and pictures then costs a model
+  start (about 12 seconds for Gemma, about 25 for the image model).
 
 ## After a change
 
 Check the file with `.venv/bin/omnia-llm models -c <config>`, which names any mistake, then
 restart omnia-llm. A newly named model is downloaded on its first request, into `.model-cache/`.
 
-Two other settings are worth knowing:
+Other settings worth knowing:
 
 - `[server] idle_timeout_minutes`: how long a model may sit unused before it stops (default 30).
   This file setting is only the default: the idle time can also be changed, between 1 minute and
   one day, from the endpoint card in Omnia, without a restart, and that choice is kept until it
   is changed again.
 - `[devices] probe`: which hardware to use: `auto`, `nvidia`, `rocm`, `apple` or `cpu`.
+- `[devices] single_device`: keep every model on one GPU (default `false`). Off, a model that
+  does not fit beside the one already running takes a second free GPU. On, it never does: it
+  starts beside the others when there is room, and otherwise waits until they have answered
+  the requests they are working on, stops them, and starts in their place. The models then
+  take turns, and the next request for a stopped one does the same in reverse. Use it on a
+  machine you share, where taking a second GPU would take one from someone else. When no
+  model is running, the first one to start picks a free GPU, as without this setting.
+- `[server] cpu_busy_load` and `[models.when_cpu_busy]`: a model that keeps part of itself in
+  the machine's memory computes that part on the CPU, which is fast while the CPUs are idle
+  and very slow when other people keep them busy. A `when_cpu_busy` table under a model gives
+  the settings to use instead when the CPUs are busy at the moment the model starts: its own
+  `required_mib`, and an `options` table whose entries replace the model's options of the same
+  name (a list is replaced whole). The CPUs count as busy when the machine's load over the
+  last minute, per CPU, is at least `cpu_busy_load` (default `0.7`). A model already running
+  keeps the settings it started with until it stops. The log names the settings each start
+  used and the load that decided it, and `/status` shows them as each model's `profile`.

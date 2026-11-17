@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import Iterable, Optional
+import functools
+from typing import Callable, Iterable, Optional
 
 from omnia_llm.config import AppConfig
-from omnia_llm.devices import DeviceProbe
+from omnia_llm.devices import CpuLoad, DeviceProbe
 from omnia_llm.engines import ENGINES, Engine
+from omnia_llm.server.placement import Placement
 from omnia_llm.server.settings import RuntimeSettings
 
 
@@ -16,7 +18,8 @@ class ModelManager:
     """One engine per configured model, and the rules for which one answers a request."""
 
     def __init__(self, config: AppConfig, probe: DeviceProbe,
-                 settings: Optional[RuntimeSettings] = None) -> None:
+                 settings: Optional[RuntimeSettings] = None, *,
+                 cpu_load: Optional[Callable[[], Optional[CpuLoad]]] = None) -> None:
         import omnia_llm.platforms  # noqa: F401 - registers the platform-only engines
 
         self.config = config
@@ -25,6 +28,9 @@ class ModelManager:
         self.engines: dict[str, Engine] = {
             spec.id: ENGINES.get(spec.engine)(spec, probe, config.paths) for spec in config.models
         }
+        self.placement = Placement(
+            self.engines, probe, single_device=config.devices.single_device,
+            cpu_load=cpu_load or functools.partial(CpuLoad.read, config.server.cpu_busy_load))
         self._warming: dict[str, asyncio.Task] = {}
         self._reaper: Optional[asyncio.Task] = None
 
@@ -41,11 +47,6 @@ class ModelManager:
             return engine
         return next((e for e in self.engines.values() if e.kind == kind), None)
 
-    def held_devices(self, exclude: Engine) -> list[str]:
-        """Devices other running models hold — tried first, so models share one device."""
-        return [e.device.id for e in self.engines.values()
-                if e is not exclude and e.running and e.device is not None]
-
     def listing(self) -> list[dict]:
         """``GET /v1/models``: from config, without starting anything."""
         return [{"id": e.id, "object": "model", "owned_by": "omnia-llm", "kind": e.kind}
@@ -53,7 +54,9 @@ class ModelManager:
 
     # --- lifecycle ---------------------------------------------------------------------------
     async def forward(self, engine: Engine, method: str, path: str, body: bytes, headers: dict):
-        return await engine.forward(method, path, body, headers, self.held_devices(engine))
+        async with self.placement.admitted(engine) as start:
+            return await engine.forward(method, path, body, headers, start.prefer,
+                                        single_device=start.single_device, cpu=start.cpu)
 
     def warm(self, kinds: Iterable[str]) -> list[str]:
         """Start every model of ``kinds`` in the background; returns what is warming."""
@@ -64,7 +67,7 @@ class ModelManager:
 
     async def _warm_one(self, engine: Engine) -> None:
         try:
-            await engine.ensure_running(self.held_devices(engine))
+            await self.placement.start(engine)
         except Exception as exc:  # noqa: BLE001 - reported in /status, never raised into the loop
             print(f"[{engine.id}] warm-up failed: {exc}", flush=True)
         finally:
@@ -75,6 +78,7 @@ class ModelManager:
         for engine_id, engine in self.engines.items():
             state = engine.status()
             state["starting"] = bool(state.get("starting")) or engine_id in self._warming
+            state["in_flight"] = self.placement.in_flight(engine)
             out[engine_id] = state
         return out
 
