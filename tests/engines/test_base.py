@@ -17,11 +17,12 @@ import types
 import pytest
 
 import omnia_llm.platforms  # noqa: F401 - registration
-from omnia_llm.config import ConfigError
+from omnia_llm.config import ConfigError, CpuBusyOverride
 from omnia_llm.engines import ENGINES, EngineBusy
 from omnia_llm.engines.base import _ProcessGroup
 from tests.helpers import (
     IGNORES_SIGTERM,
+    cpu,
     fake_lifecycle,
     fake_probe,
     free_port,
@@ -105,6 +106,65 @@ class TestItStartsOnlyWhenAsked:
         engine._group.code = -9
         await engine.ensure_running()
         assert reasons == ["exited"] and launched == ["nvidia:7", "nvidia:7"]
+
+
+#: Gemma's two ways to run: some experts in RAM by default, all on the card when the CPU is busy.
+OFFLOADED = {"required_mib": 15500, "extra_args": ["--n-cpu-moe", "8", "-np", "2"]}
+WHOLE = CpuBusyOverride(required_mib=19000, options={"extra_args": ["-np", "2"]})
+
+
+class TestTheCpuDecidesHowItStarts:
+    async def test_a_free_cpu_starts_it_with_its_own_settings(self, paths):
+        engine, _ = _engine(paths, when_cpu_busy=WHOLE, **OFFLOADED)
+        await engine.ensure_running(cpu=cpu(4))
+        assert engine.options.extra_args == ("--n-cpu-moe", "8", "-np", "2")
+        assert engine.required_mib == 15500 and engine.status()["profile"] == "default"
+
+    async def test_a_busy_cpu_starts_it_with_its_busy_cpu_settings(self, paths):
+        engine, _ = _engine(paths, when_cpu_busy=WHOLE, **OFFLOADED)
+        await engine.ensure_running(cpu=cpu(73))
+        assert engine.options.extra_args == ("-np", "2")
+        assert engine.required_mib == 19000 and engine.status()["profile"] == "when_cpu_busy"
+
+    async def test_the_busy_cpu_settings_decide_where_it_fits(self, paths):
+        """A card with room for the offloaded model and not for the whole one."""
+        small = fake_probe([gpu(7, total=18000)])
+        engine, _ = _engine(paths, probe=small, when_cpu_busy=WHOLE, **OFFLOADED)
+        with pytest.raises(EngineBusy, match="19000 MiB"):
+            await engine.ensure_running(cpu=cpu(73))
+        await engine.ensure_running(cpu=cpu(4))
+        assert engine.running
+
+    async def test_each_start_decides_again(self, paths):
+        engine, _ = _engine(paths, when_cpu_busy=WHOLE, **OFFLOADED)
+        await engine.ensure_running(cpu=cpu(73))
+        await engine.stop("idle")
+        await engine.ensure_running(cpu=cpu(4))
+        assert engine.options.extra_args == ("--n-cpu-moe", "8", "-np", "2")
+
+    async def test_a_model_without_busy_cpu_settings_keeps_its_own(self, paths):
+        engine, _ = _engine(paths, **OFFLOADED)
+        await engine.ensure_running(cpu=cpu(73))
+        assert engine.required_mib == 15500 and engine.status()["profile"] == "default"
+
+    async def test_an_unknown_cpu_load_is_taken_as_free(self, paths):
+        engine, _ = _engine(paths, when_cpu_busy=WHOLE, **OFFLOADED)
+        await engine.ensure_running(cpu=None)
+        assert engine.required_mib == 15500
+
+    async def test_the_log_says_which_settings_and_why(self, paths, capsys):
+        engine, _ = _engine(paths, when_cpu_busy=WHOLE, **OFFLOADED)
+        await engine.ensure_running(cpu=cpu(73))
+        said = capsys.readouterr().out
+        assert "[omnia-local] starting on nvidia:7 with its when_cpu_busy settings" in said
+        assert "CPU busy: load 73.0 on 48 CPUs" in said
+
+    async def test_on_a_single_device_a_full_held_card_is_a_refusal_naming_it(self, paths):
+        probe = fake_probe([gpu(2), gpu(7, used=24000, busy=True)])
+        engine, launched = _engine(paths, probe=probe, required_mib=5000)
+        with pytest.raises(EngineBusy, match="nvidia:7, the device the other models are on"):
+            await engine.ensure_running(prefer=["nvidia:7"], single_device=True)
+        assert launched == []
 
 
 class TestItGivesTheCardBack:
@@ -521,6 +581,12 @@ class TestConfigIsChecked:
         with pytest.raises(ConfigError, match="true or false"):
             ENGINES.get("diffusers")(spec(kind="image", engine="diffusers", cpu_offload="no"),
                                      fake_probe(), paths)
+
+    def test_a_busy_cpu_option_is_checked_with_the_others(self, paths):
+        """At startup, not at the first start on a busy CPU, hours later."""
+        bad = CpuBusyOverride(options={"max_len": 9})
+        with pytest.raises(ConfigError, match="when_cpu_busy: unknown option"):
+            ENGINES.get("vllm")(spec(when_cpu_busy=bad), fake_probe(), paths)
 
     def test_a_whole_number_is_a_fine_fraction(self, paths):
         engine = ENGINES.get("vllm")(spec(gpu_memory_utilization=1), fake_probe(), paths)

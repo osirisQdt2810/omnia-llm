@@ -48,3 +48,16 @@ class TestPickingOne:
 
     def test_somebody_elses_busy_card_is_never_taken(self):
         assert fake_probe([gpu(1, used=3000, busy=True)]).pick(100) is None
+
+
+class TestPickingOnASingleDevice:
+    def test_the_card_we_hold_is_reused_when_it_has_room(self):
+        probe = fake_probe([gpu(2), gpu(7, used=13800, busy=True)])
+        assert probe.pick(5000, prefer=["nvidia:7"], single_device=True).index == 7
+
+    def test_a_full_held_card_is_never_traded_for_a_second_one(self):
+        probe = fake_probe([gpu(2), gpu(7, used=24000, busy=True)])
+        assert probe.pick(5000, prefer=["nvidia:7"], single_device=True) is None
+
+    def test_holding_nothing_any_free_card_will_do(self):
+        assert fake_probe([gpu(2), gpu(7)]).pick(5000, single_device=True).index == 7

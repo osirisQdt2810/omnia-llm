@@ -41,7 +41,7 @@ class _Gateway:
             self.answer(engine.id, lambda request: httpx.Response(200, json={"ok": True}))
 
     def _start(self, model_id):
-        async def ensure_running(prefer=()):
+        async def ensure_running(prefer=(), **start):
             self.started.append(model_id)
         return ensure_running
 
@@ -177,7 +177,7 @@ def test_an_engine_that_does_not_answer_is_not_called_a_failed_start(gateway):
 
 
 def test_a_start_that_fails_is_reported_as_one(gateway):
-    async def fails(prefer=()):
+    async def fails(prefer=(), **start):
         raise RuntimeError("")
     gateway.app.state.manager.engines["omnia-local"].ensure_running = fails
     r = gateway.request("POST", "/v1/chat/completions", json={})

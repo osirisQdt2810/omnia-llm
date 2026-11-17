@@ -36,6 +36,9 @@ class ServerConfig:
     #: default only: a client may override it at runtime (``PUT /settings``).
     idle_timeout_minutes: float = 30.0
     reaper_interval_seconds: float = 20.0
+    #: The 1-minute load average per CPU at or above which the host's CPU counts as busy when a
+    #: model starts: the model then starts with its ``when_cpu_busy`` settings.
+    cpu_busy_load: float = 0.7
 
     @property
     def idle_timeout_seconds(self) -> float:
@@ -87,6 +90,21 @@ class PathsConfig:
 class DevicesConfig:
     #: ``auto`` picks the first available probe by priority (nvidia, rocm, apple, cpu).
     probe: str = "auto"
+    #: Every model on ONE device: while any model holds one, the others start there or wait their
+    #: turn, never on a second. Off, a model that does not fit beside the others takes a free one.
+    single_device: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class CpuBusyOverride:
+    """A model's ``[models.when_cpu_busy]`` table: what changes when it starts on a busy CPU.
+
+    Laid over the model shallowly: ``required_mib`` replaces the model's own, and each option
+    named here replaces that option whole (a list is not merged item by item).
+    """
+
+    required_mib: Optional[int] = None
+    options: dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -102,6 +120,19 @@ class ModelSpec:
     required_mib: int = 0
     #: Engine-specific settings, validated by the engine's own ``Options`` type.
     options: dict[str, Any] = dataclasses.field(default_factory=dict)
+    #: What changes when the host's CPU is busy at the moment the model starts.
+    when_cpu_busy: Optional[CpuBusyOverride] = None
+
+    def profile(self, cpu_busy: bool) -> "ModelSpec":
+        """This model as it starts with the CPU busy or not: itself, or with ``when_cpu_busy``
+        laid over it (which then has no override of its own left)."""
+        override = self.when_cpu_busy
+        if not cpu_busy or override is None:
+            return self
+        required = self.required_mib if override.required_mib is None else override.required_mib
+        return dataclasses.replace(self, required_mib=required,
+                                   options={**self.options, **override.options},
+                                   when_cpu_busy=None)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -127,7 +158,7 @@ class AppConfig:
             raise ConfigError(f"unknown section(s): {', '.join(sorted(unknown))}")
         server = _build(ServerConfig, data.get("server", {}), "server")
         _check_whole(server.port, "[server]", "port", 1, 65535)
-        for name in ("idle_timeout_minutes", "reaper_interval_seconds"):
+        for name in ("idle_timeout_minutes", "reaper_interval_seconds", "cpu_busy_load"):
             _check_positive(getattr(server, name), "[server]", name)
         paths_raw = dict(data.get("paths", {}))
         for key in ("state", "model_cache"):
@@ -136,6 +167,9 @@ class AppConfig:
                 paths_raw[key] = value if value.is_absolute() else ROOT / value
         paths = _build(PathsConfig, paths_raw, "paths")
         devices = _build(DevicesConfig, data.get("devices", {}), "devices")
+        if not isinstance(devices.single_device, bool):
+            raise ConfigError("[devices]: single_device must be true or false, "
+                              f"not {devices.single_device!r}")
         models = tuple(_model(raw, i) for i, raw in enumerate(data.get("models", [])))
         if not models:
             raise ConfigError("no [[models]] configured — there is nothing to serve")
@@ -190,5 +224,21 @@ def _model(raw: dict[str, Any], index: int) -> ModelSpec:
     _check_whole(raw["port"], where, "port", 1, 65535)
     # Compared with each device's free memory at every start: a string there fails them all.
     _check_whole(raw.get("required_mib", 0), where, "required_mib", 0)
+    if "when_cpu_busy" in raw:
+        raw = {**raw, "when_cpu_busy": _cpu_busy_override(raw["when_cpu_busy"], where)}
     spec = _build(ModelSpec, raw, where)
     return dataclasses.replace(spec, options=dict(spec.options))
+
+
+def _cpu_busy_override(raw: Any, where: str) -> CpuBusyOverride:
+    """A ``[models.when_cpu_busy]`` table. Its options are checked by the model's engine, as the
+    model's own are."""
+    where = f"{where} when_cpu_busy"
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where}: must be a table, not {raw!r}")
+    override = _build(CpuBusyOverride, raw, where)
+    if override.required_mib is not None:
+        _check_whole(override.required_mib, where, "required_mib", 0)
+    if not isinstance(override.options, dict):
+        raise ConfigError(f"{where}: options must be a table, not {override.options!r}")
+    return dataclasses.replace(override, options=dict(override.options))

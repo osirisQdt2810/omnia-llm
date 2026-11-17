@@ -10,7 +10,7 @@ import sys
 import time
 
 from omnia_llm.config import ModelSpec
-from omnia_llm.devices import Device, DeviceProbe
+from omnia_llm.devices import CpuLoad, Device, DeviceProbe
 
 #: A process that ignores SIGTERM, as a hung shutdown does: only SIGKILL ends it. It prints
 #: "ready" once the SIGTERM would be ignored, to its log.
@@ -66,10 +66,16 @@ def fake_probe(devices=None, backend="nvidia"):
     return probe_class(devices)
 
 
-def spec(id="omnia-local", kind="text", engine="vllm", port=8722, required_mib=0, **options):
+def spec(id="omnia-local", kind="text", engine="vllm", port=8722, required_mib=0,
+         when_cpu_busy=None, **options):
     options.setdefault("model", "test/model")
     return ModelSpec(id=id, kind=kind, engine=engine, port=port, required_mib=required_mib,
-                     options=options)
+                     options=options, when_cpu_busy=when_cpu_busy)
+
+
+def cpu(load, cpus=48, busy_from=0.7):
+    """The host's CPU load as a probe would read it: ``cpu(40)`` is busy, ``cpu(4)`` free."""
+    return CpuLoad(load=load, cpus=cpus, busy_from=busy_from)
 
 
 class FakeGroup:

@@ -96,18 +96,23 @@ class DeviceProbe(abc.ABC):
             DeviceError: when they cannot be read at all.
         """
 
-    def pick(self, required_mib: int, prefer: Iterable[str] = ()) -> Optional[Device]:
+    def pick(self, required_mib: int, prefer: Iterable[str] = (), *,
+             single_device: bool = False) -> Optional[Device]:
         """A device with ``required_mib`` to spare, preferring one we ALREADY hold.
 
         Two models are meant to share one device: a device we hold is not "free" by any honest
         definition, and asking for a free one would take a SECOND from the pool. So fill the one
         we are on until it cannot take the load, then fall back to an idle one — the highest
-        index, leaving low indices (often the display GPU) for people.
+        index, leaving low indices (often the display GPU) for people. With ``single_device``
+        there is no falling back: a device we hold, or none.
         """
+        prefer = tuple(prefer)
         devices = {d.id: d for d in self.list_devices()}
         for wanted in prefer:
             held = devices.get(wanted)
             if held is not None and held.free_mib >= required_mib:
                 return held
+        if single_device and prefer:
+            return None
         free = [d for d in devices.values() if d.is_free and d.free_mib >= required_mib]
         return max(free, key=lambda d: d.index) if free else None
