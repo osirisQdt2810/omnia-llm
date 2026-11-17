@@ -385,9 +385,9 @@ class ProcessEngine(Engine):
             prefer = tuple(prefer)
             device = self.probe.pick(profile.required_mib, prefer, single_device=single_device)
             if device is None:
-                where = (f"{prefer[0]}, the device the other models are on,"
-                         if single_device and prefer else "no device")
-                raise EngineBusy(f"{where} has {profile.required_mib} MiB free right now "
+                where = (f"{prefer[0]}, the device the other models are on, does not have"
+                         if single_device and prefer else "no device has")
+                raise EngineBusy(f"{where} {profile.required_mib} MiB free right now "
                                  f"for {self.id!r} — nothing was started")
             self._profile, self.options = profile, self.check_options(profile)
             _say(f"[{self.id}] starting on {device.id} with its {self.profile} settings "

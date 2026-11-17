@@ -39,6 +39,8 @@ class _Box:
         self.actual: dict[str, int] = {}
         #: Memory somebody else holds, by device id.
         self.foreign: dict[str, int] = {}
+        #: How often the cards were measured: each is a GPU tool run on the real probes.
+        self.measured = 0
         probe = fake_probe([gpu(6), gpu(7)])
         probe.list_devices = self._devices
         self.manager = ModelManager(cfg, probe, cpu_load=lambda: cpu(self.load))
@@ -70,6 +72,7 @@ class _Box:
         return [e.id for e in self.manager.engines.values() if e.running]
 
     def _devices(self):
+        self.measured += 1
         devices = []
         for index in (6, 7):
             device_id = f"nvidia:{index}"
@@ -148,6 +151,24 @@ async def test_a_model_in_use_finishes_its_requests_before_it_is_stopped(tmp_pat
     assert await text == await image == 200
     assert box.served == ["gemma", "sdxl"]
     assert box.launched == [("gemma", "nvidia:7"), ("sdxl", "nvidia:7")]
+
+
+async def test_waiting_for_a_model_to_finish_does_not_measure_the_card_again(tmp_path):
+    """Each measurement is a GPU tool run on the event loop. Taken on every poll, a long request
+    kept the loop busy enough to stall the very request the start was waiting for."""
+    box = _Box(tmp_path, load=BUSY)
+    released = box.hold("gemma")
+    text = asyncio.create_task(box.ask("gemma"))
+    await until(lambda: box.manager.placement.in_flight(box.engine("gemma")) == 1)
+    image = asyncio.create_task(box.ask("sdxl"))
+    await asyncio.sleep(0.05)  # dozens of polls at the test's 10 ms
+    before = box.measured
+    await asyncio.sleep(0.2)
+    assert box.measured == before, "measured on every poll"
+
+    released.set()
+    assert await text == await image == 200
+    assert box.measured - before <= 3  # once after the stop, and the start's own pick
 
 
 async def test_new_requests_for_a_model_waiting_to_stop_wait_their_turn(tmp_path):

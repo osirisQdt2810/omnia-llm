@@ -129,21 +129,28 @@ class Placement:
                     raise EngineBusy(f"{engine.id!r} does not fit beside {names} on {device_id}; "
                                      "it starts when it is asked for")
                 self._draining.update(e.id for e in residents)
-                idle = next((e for e in residents if not self._in_flight[e.id]), None)
+                # Waiting, only the requests in flight change, not what the card holds: watch
+                # them, and measure the card again only once a model has left it. Measured on
+                # every poll, a long request kept the GPU tool forking on the event loop, which
+                # stalled the very request being waited for.
+                idle = None
+                while all(e.running for e in residents):
+                    idle = next((e for e in residents if not self._in_flight[e.id]), None)
+                    if idle is not None:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise EngineBusy(f"{names} still had requests in flight after "
+                                         f"{self.drain_timeout_seconds:.0f}s; {engine.id!r} was "
+                                         "not started")
+                    if not told:
+                        told = True
+                        print(f"[{engine.id}] waiting for {names} to finish on {device_id}, to "
+                              "take its place", flush=True)
+                    await asyncio.sleep(self.drain_poll_seconds)
+                emptied = device_id
                 if idle is not None:
                     # No wait between the check and the stop: no request can slip in between.
-                    emptied = device_id
                     await idle.stop(f"making room for {engine.id!r}")
-                    continue
-                if time.monotonic() >= deadline:
-                    raise EngineBusy(f"{names} still had requests in flight after "
-                                     f"{self.drain_timeout_seconds:.0f}s; {engine.id!r} was not "
-                                     "started")
-                if not told:
-                    told = True
-                    print(f"[{engine.id}] waiting for {names} to finish on {device_id}, to take "
-                          "its place", flush=True)
-                await asyncio.sleep(self.drain_poll_seconds)
         finally:
             self._draining.clear()
 
