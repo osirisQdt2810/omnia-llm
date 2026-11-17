@@ -106,16 +106,20 @@ class Placement:
 
     async def _room_for(self, engine: Engine, need: int, make_room: bool) -> tuple[str, ...]:
         """The device ``engine`` must start on, as ``prefer``, with ``need`` MiB there for it:
-        the one the running models hold, emptied of them as far as it takes, or none when no
-        model holds one (the engine then picks a free device)."""
+        the one the running models hold, emptied of them as far as it takes (all of them
+        included), or none when no model held one as the start began (the engine then picks a
+        free device)."""
         deadline = time.monotonic() + self.drain_timeout_seconds
         told = False
+        #: The device this start stopped models on. Emptied by it, it is still the one device:
+        #: picked afresh, a card ranked above it would become a second.
+        emptied: Optional[str] = None
         try:
             while True:
                 residents = [e for e in self.engines.values()
                              if e is not engine and e.running and e.device is not None]
                 if not residents:
-                    return ()
+                    return (emptied,) if emptied else ()
                 device_id = residents[0].device.id
                 residents = [e for e in residents if e.device.id == device_id]
                 if self._room(device_id, residents) >= need:
@@ -128,6 +132,7 @@ class Placement:
                 idle = next((e for e in residents if not self._in_flight[e.id]), None)
                 if idle is not None:
                     # No wait between the check and the stop: no request can slip in between.
+                    emptied = device_id
                     await idle.stop(f"making room for {engine.id!r}")
                     continue
                 if time.monotonic() >= deadline:

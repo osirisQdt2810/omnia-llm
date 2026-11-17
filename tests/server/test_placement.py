@@ -120,6 +120,18 @@ async def test_an_image_model_between_images_still_counts_what_it_declared(tmp_p
     assert box.launched == [("sdxl", "nvidia:7"), ("gemma", "nvidia:7")]
 
 
+async def test_a_model_that_stopped_every_other_starts_on_the_card_it_emptied(tmp_path):
+    """Nothing runs once the last model on the card is stopped, but the card is not up for a
+    fresh pick: one ranked above it, here the idle card 6 over card 7 still showing a little
+    memory held, would make it a second card."""
+    box = _Box(tmp_path, load=BUSY)
+    await box.ask("gemma")
+    box.foreign["nvidia:7"] = 600  # what a stopped model's card can still show for a moment
+    await box.ask("sdxl")
+    assert box.launched == [("gemma", "nvidia:7"), ("sdxl", "nvidia:7")]
+    assert box.running() == ["sdxl"]
+
+
 async def test_a_model_in_use_finishes_its_requests_before_it_is_stopped(tmp_path):
     box = _Box(tmp_path, load=BUSY)
     released = box.hold("gemma")
